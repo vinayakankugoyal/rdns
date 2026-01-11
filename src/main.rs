@@ -1,6 +1,8 @@
 #[allow(unused_imports)]
 use std::net::UdpSocket;
 
+mod packet;
+
 fn main() {
     // You can use print statements as follows for debugging, they'll be visible when running tests.
     println!("Logs from your program will appear here!");
@@ -13,7 +15,10 @@ fn main() {
             Ok((size, source)) => {
                 println!("Received {} bytes from {}", size, source);
 
-                let response = parse(&buf);
+                let input_packet = packet::RecvPacket::new(&buf);
+
+                let out_packet = packet::RespPacket::from_recv_packet(input_packet);
+
 
                 udp_socket
                     .send_to(&response, source)
