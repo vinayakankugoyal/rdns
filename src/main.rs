@@ -15,7 +15,7 @@ fn main() {
             Ok((size, source)) => {
                 println!("Received {} bytes from {}", size, source);
 
-                let input_packet = packet::RecvPacket::new(&buf);
+                let input_packet = packet::RecvPacket::new(&buf[0..size]);
 
                 let out_packet = packet::RespPacket::from_recv_packet(input_packet);
 
