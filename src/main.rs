@@ -13,40 +13,7 @@ fn main() {
             Ok((size, source)) => {
                 println!("Received {} bytes from {}", size, source);
 
-                let mut response = parse_header(&buf);
-
-                let mut qa: Vec<u8> = vec![
-                    // Question
-                    // Domain Name
-                    0x0c, //codecrafters
-                    b'c',b'o',b'd',b'e',b'c',b'r',b'a',b'f',b't',b'e',b'r',b's',
-                    0x02, //io
-                    b'i',b'o',
-                    0x00,
-                    // Type
-                    0x00,0x01,
-                    // Class
-                    0x00,0x01,
-                    // Answer
-                    // Domain Name
-                    0x0c, //codecrafters
-                    b'c',b'o',b'd',b'e',b'c',b'r',b'a',b'f',b't',b'e',b'r',b's',
-                    0x02, //io
-                    b'i',b'o',
-                    0x00,
-                    // Type
-                    0x00,0x01,
-                    // Class
-                    0x00,0x01,
-                    // TTL
-                    0x00,0x00,0x00,0x3C,
-                    // RDLENGTH
-                    0x00,0x04,
-                    // RDATA
-                    0x08,0x08,0x08,0x08
-                ];
-
-                response.append(&mut qa);
+                let response = parse(&buf);
 
                 udp_socket
                     .send_to(&response, source)
@@ -60,13 +27,14 @@ fn main() {
     }
 }
 
-fn parse_header(header: &[u8]) -> Vec<u8> {
+
+fn parse_header(req: &[u8]) -> Vec<u8> {
     let mut result: Vec<u8> = Vec::new();
     // Packet ID
-    result.push(header[0]);
-    result.push(header[1]);
+    result.push(req[0]);
+    result.push(req[1]);
 
-    let mut qr_opcode_aa_tc_rd = header[2];
+    let mut qr_opcode_aa_tc_rd = req[2];
     // Set qr bit to 1;
     qr_opcode_aa_tc_rd = qr_opcode_aa_tc_rd | 1u8 << 7;
     // Set aa bit to 0;
@@ -96,6 +64,74 @@ fn parse_header(header: &[u8]) -> Vec<u8> {
     result.push(0x00);
     result.push(0x01);
 
+    return result;
+}
+
+fn parse_question(req: &[u8]) -> Vec<u8> {
+    let mut domain = Vec::new();
+
+    let mut i: usize = 12;
+    let mut ch: u8 = req[i];
+    while ch != 0x00 {
+        domain.push(ch);
+        i +=1;
+        ch = req[i];
+    }
+    domain.push(ch);
+
+    i+=1;
+    let mut tp: Vec<u8> = vec![req[i]];
+    i+=1;
+    tp.push(req[i]);
+
+    i+=1;
+    let mut class = vec![req[i]];
+    i+=1;
+    class.push(req[i]);
+
+    let mut question: Vec<u8> = Vec::new();
+    for d in domain.iter() {
+        question.push(d.clone());
+    }
+    for d in tp.iter() {
+        question.push(d.clone());
+    }
+    for d in class.iter() {
+        question.push(d.clone());
+    }
+
+    let mut answer: Vec<u8> = Vec::new();
+    for d in domain.iter() {
+        answer.push(d.clone());
+    }
+    for d in tp {
+        answer.push(d);
+    }
+    for d in class {
+        answer.push(d);
+    }
+    answer.push(0x00);
+    answer.push(0x00);
+    answer.push(0x00);
+    answer.push(0x3c);
+
+    answer.push(0x00);
+    answer.push(0x04);
+
+    answer.push(0x08);
+    answer.push(0x08);
+    answer.push(0x08);
+    answer.push(0x08);
+
+    question.append(&mut answer);
+
+    return question;
+
+}
+
+fn parse(req: &[u8]) -> Vec<u8> {
+    let mut result = parse_header(req);
+    result.append(&mut parse_question(req));
     return result;
 
 }
