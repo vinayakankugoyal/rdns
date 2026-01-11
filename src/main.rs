@@ -19,6 +19,7 @@ fn main() {
 
                 let out_packet = packet::RespPacket::from_recv_packet(input_packet);
 
+                let response = out_packet.to_bytes();
 
                 udp_socket
                     .send_to(&response, source)
