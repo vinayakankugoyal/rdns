@@ -12,15 +12,10 @@ fn main() {
         match udp_socket.recv_from(&mut buf) {
             Ok((size, source)) => {
                 println!("Received {} bytes from {}", size, source);
-                let response = [
-                    // Header
-                    0x04,0xD2, // Packet ID
-                    0x80, // QR=1,OPCODE=0000,AA=0,TC=0,RD=0
-                    0x00, // RA=0,Z=000,RCODE=0000 
-                    0x00,0x01, //QDCOUNT=0000000000000001
-                    0x00,0x01, //ANCOUNT=0000000000000001
-                    0x00,0x00, //NSCOUNT=0000000000000000
-                    0x00,0x00, //ARCOUNT=0000000000000000
+
+                let mut response = parse_header(&buf);
+
+                let mut qa: Vec<u8> = vec![
                     // Question
                     // Domain Name
                     0x0c, //codecrafters
@@ -50,6 +45,9 @@ fn main() {
                     // RDATA
                     0x08,0x08,0x08,0x08
                 ];
+
+                response.append(&mut qa);
+
                 udp_socket
                     .send_to(&response, source)
                     .expect("Failed to send response");
@@ -60,4 +58,44 @@ fn main() {
             }
         }
     }
+}
+
+fn parse_header(header: &[u8]) -> Vec<u8> {
+    let mut result: Vec<u8> = Vec::new();
+    // Packet ID
+    result.push(header[0]);
+    result.push(header[1]);
+
+    let mut qr_opcode_aa_tc_rd = header[2];
+    // Set qr bit to 1;
+    qr_opcode_aa_tc_rd = qr_opcode_aa_tc_rd | 1u8 << 7;
+    // Set aa bit to 0;
+    qr_opcode_aa_tc_rd = qr_opcode_aa_tc_rd & !(1u8 << 2);
+    // Set tc bit to 0;
+    qr_opcode_aa_tc_rd = qr_opcode_aa_tc_rd & !(1u8 << 1);
+    result.push(qr_opcode_aa_tc_rd);
+
+    if qr_opcode_aa_tc_rd >> 3 & 0b00001111 != 0b00000000 {
+            // RA Z RCODE
+            result.push(0x04);
+    } else {
+            // RA Z RCODE
+            result.push(0x00);
+    }
+
+    // QDCOUNT
+    result.push(0x00);
+    result.push(0x01);
+    // ANCOUNT
+    result.push(0x00);
+    result.push(0x01);
+    // NSCOUNT
+    result.push(0x00);
+    result.push(0x01);
+    // ARCOUNT
+    result.push(0x00);
+    result.push(0x01);
+
+    return result;
+
 }
