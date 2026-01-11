@@ -106,33 +106,45 @@ impl RecvPacket {
         let header = Header::new(&buf[0..12]);
         return Self {
             header: header, 
-            questions:  RecvPacket::questions(&buf[12..])
+            questions:  RecvPacket::questions(&buf)
         };
     }
 
+    fn qname(buf: &[u8], start: usize) -> (Vec<u8>, usize) {
+        let mut name: Vec<u8> = Vec::new();
+        let mut n = start;
+        loop {
+            if buf[n] & 0b11000000 == 0b11000000 {
+                let new_start = buf[n+1] as usize;
+                let (common,  _) = Self::qname(&buf, new_start);
+                name.extend_from_slice(&common);
+                // +2 because we also read the offset and the pointer;
+                return (name, n + 2 - start);
+            }
+
+            if buf[n] == 0 {
+                name.push(buf[n]);
+                return (name, n+1 - start);
+            }
+            name.push(buf[n]);
+            n += 1;
+        }
+    }
+
     fn questions(buf: &[u8]) -> Vec<Question>{
-        let mut n = 0;
-        let mut start = 0;
+        let mut n = 12;
+        let mut start = 12;
         let mut questions: Vec<Question> = Vec::new();
         while n < buf.len() {
-            let mut name: Vec<u8> = Vec::new();
-            loop {
-                let ch = buf[n];
-                if ch == 0 {
-                    name.extend_from_slice(&buf[start..=n]);
-                        questions.push(Question {
-                        name: name, 
-                        tp: u16::from_be_bytes([buf[n+1], buf[n+2]]),
-                        class: u16::from_be_bytes([buf[n+3], buf[n+4]])  
-                    });
-                    start = n + 5;
-                    n = n + 5;
-                    break;
-                }
-                
-                n = n+1;
-            }
-            n = n+4;
+            let (name, advance) = Self::qname(buf, start);
+            n = n + advance;
+            questions.push(Question { 
+                name,
+                tp: u16::from_be_bytes([buf[n], buf[n+1]]),
+                class: u16::from_be_bytes([buf[n+2], buf[n+3]]),  
+            });
+            n = n + 4;
+            start = n;
         }
 
         return questions;
