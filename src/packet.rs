@@ -1,5 +1,6 @@
+use std::fmt::Display;
 
-#[derive(Debug,Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct Header {
     pub packet_id: u16,
     pub qr: u8,
@@ -13,12 +14,12 @@ pub struct Header {
     pub qdcount: u16,
     pub ancount: u16,
     pub nscount: u16,
-    pub arcount: u16
+    pub arcount: u16,
 }
 
 impl Header {
     pub fn new(buf: &[u8]) -> Self {
-        return Self { 
+        return Self {
             packet_id: u16::from_be_bytes([buf[0], buf[1]]),
             qr: (buf[2] >> 7 & 0x01),
             opcode: buf[2] >> 3 & 0b00001111,
@@ -31,14 +32,17 @@ impl Header {
             qdcount: u16::from_be_bytes([buf[4], buf[5]]),
             ancount: u16::from_be_bytes([buf[6], buf[7]]),
             nscount: u16::from_be_bytes([buf[8], buf[9]]),
-            arcount: u16::from_be_bytes([buf[10], buf[11]])
+            arcount: u16::from_be_bytes([buf[10], buf[11]]),
         };
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut result: Vec<u8> = Vec::new();
         result.extend_from_slice(&self.packet_id.to_be_bytes());
-        result.extend_from_slice(&(self.qr << 7 | self.opcode << 3 | self.aa << 2 | self.tc << 1 | self.rd).to_be_bytes());
+        result.extend_from_slice(
+            &(self.qr << 7 | self.opcode << 3 | self.aa << 2 | self.tc << 1 | self.rd)
+                .to_be_bytes(),
+        );
         result.extend_from_slice(&(self.ra << 7 | self.z << 4 | self.rcode).to_be_bytes());
         result.extend_from_slice(&self.qdcount.to_be_bytes());
         result.extend_from_slice(&self.ancount.to_be_bytes());
@@ -48,11 +52,11 @@ impl Header {
     }
 }
 
-#[derive(Debug,Clone)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct Question {
     pub name: Vec<u8>,
     pub tp: u16,
-    pub class: u16, 
+    pub class: u16,
 }
 impl Question {
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -60,6 +64,24 @@ impl Question {
         res.extend_from_slice(&self.tp.to_be_bytes());
         res.extend_from_slice(&self.class.to_be_bytes());
         res
+    }
+}
+
+impl Display for Question {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut n = 0;
+        let mut res: Vec<String> = Vec::new();
+        while n < self.name.len() {
+            let length = self.name[n] as usize;
+            if length == 0 {
+                break;
+            }
+            let label = &self.name[n + 1..n + 1 + length];
+            res.push(String::from_utf8_lossy(&label).into_owned());
+            n = n + 1 + length;
+        }
+
+        write!(f, "question={}", res.join("."))
     }
 }
 
@@ -83,16 +105,22 @@ impl Answer {
         result.extend_from_slice(&self.data);
         return result;
     }
+}
 
-    pub fn from_question(question: Question) -> Answer {
-        Answer { 
-            name: question.name.clone(), 
-            tp: question.tp, 
-            class: question.class, 
-            ttl: 0x3C, 
-            length: 4, 
-            data: vec![8, 8, 8, 8]
+impl Display for Answer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let question = Question {
+            name: self.name.clone(),
+            tp: self.tp,
+            class: self.class,
+        };
+
+        let mut data_string: Vec<String> = Vec::new();
+        for d in self.data.iter() {
+            data_string.push(format!("{}", d));
         }
+
+        write!(f, "{}\nanswer={}", question, data_string.join("."))
     }
 }
 
@@ -103,32 +131,17 @@ pub struct DNSPacket {
     pub answers: Vec<Answer>,
 }
 
+#[allow(unused)]
 impl DNSPacket {
     pub fn from_bytes(buf: &[u8]) -> Self {
         let header = Header::new(&buf[0..12]);
         let (questions, offset) = DNSPacket::parse_questions(&buf, 12, header.qdcount);
         let (answers, _) = DNSPacket::parse_answers(&buf, offset, header.ancount);
         return Self {
-            header, 
+            header,
             questions,
             answers,
         };
-    }
-
-    pub fn with_answers(&self) -> DNSPacket {
-        let mut header = self.header.clone();
-        header.qr = 1;
-        header.ancount = header.qdcount;
-        if header.opcode != 0 {
-            header.rcode = 4;
-        }
-        let questions = self.questions.clone();
-        let mut answers: Vec<Answer> = Vec::new();
-        for q in questions.iter() {
-            answers.push(Answer::from_question(q.clone()));
-        }
-
-        return DNSPacket { header, questions, answers }
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -149,31 +162,37 @@ impl DNSPacket {
             header.qdcount = 1;
             let mut questions: Vec<Question> = Vec::new();
             questions.push(q.clone());
-            res.push(
-                DNSPacket { header, questions, answers: Vec::new() }
-            );
+            res.push(DNSPacket {
+                header,
+                questions,
+                answers: Vec::new(),
+            });
         }
-        return  res;
+        return res;
     }
 
     fn qname(buf: &[u8], start: usize) -> (Vec<u8>, usize) {
         let mut name: Vec<u8> = Vec::new();
         let mut n = start;
         loop {
-            if buf[n] & 0b11000000 == 0b11000000 {
-                let new_start = buf[n+1] as usize;
-                let (common,  _) = Self::qname(&buf, new_start);
+            let b = buf[n];
+            if (b & 0b11000000) == 0b11000000 {
+                let new_start = (((b as u16) & 0x3f) << 8) | (buf[n + 1] as u16);
+                let (common, _) = Self::qname(&buf, new_start as usize);
                 name.extend_from_slice(&common);
                 // +2 because we also read the offset and the pointer;
                 return (name, n + 2 - start);
             }
 
-            if buf[n] == 0 {
-                name.push(buf[n]);
+            if b == 0 {
+                name.push(b);
                 return (name, n + 1 - start);
             }
-            name.push(buf[n]);
-            n += 1;
+
+            name.push(b);
+            let len = b as usize;
+            name.extend_from_slice(&buf[n + 1..n + 1 + len]);
+            n = n + 1 + len;
         }
     }
 
@@ -182,10 +201,10 @@ impl DNSPacket {
         for _ in 0..count {
             let (name, advance) = Self::qname(buf, offset);
             offset += advance;
-            questions.push(Question { 
+            questions.push(Question {
                 name,
-                tp: u16::from_be_bytes([buf[offset], buf[offset+1]]),
-                class: u16::from_be_bytes([buf[offset+2], buf[offset+3]]),  
+                tp: u16::from_be_bytes([buf[offset], buf[offset + 1]]),
+                class: u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]),
             });
             offset += 4;
         }
@@ -197,14 +216,19 @@ impl DNSPacket {
         for _ in 0..count {
             let (name, advance) = Self::qname(buf, offset);
             offset += advance;
-            let tp = u16::from_be_bytes([buf[offset], buf[offset+1]]);
-            let class = u16::from_be_bytes([buf[offset+2], buf[offset+3]]);
-            let ttl = u32::from_be_bytes([buf[offset+4], buf[offset+5], buf[offset+6], buf[offset+7]]);
-            let length = u16::from_be_bytes([buf[offset+8], buf[offset+9]]);
+            let tp = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
+            let class = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]);
+            let ttl = u32::from_be_bytes([
+                buf[offset + 4],
+                buf[offset + 5],
+                buf[offset + 6],
+                buf[offset + 7],
+            ]);
+            let length = u16::from_be_bytes([buf[offset + 8], buf[offset + 9]]);
             offset += 10;
-            
-            let data = buf[offset..offset+length as usize].to_vec();
-            
+
+            let data = buf[offset..offset + length as usize].to_vec();
+
             offset += length as usize;
 
             answers.push(Answer {
@@ -213,11 +237,9 @@ impl DNSPacket {
                 class,
                 ttl,
                 length,
-                data
+                data,
             });
         }
         (answers, offset)
     }
 }
-
-

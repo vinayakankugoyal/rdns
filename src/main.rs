@@ -1,106 +1,122 @@
-use std::env;
-#[allow(unused_imports)]
-use std::net::UdpSocket;
-
-use crate::packet::DNSPacket;
+use crate::packet::{Answer, DNSPacket, Question};
+use std::collections::HashMap;
+use std::io;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::net::UdpSocket;
 
 mod packet;
 
-fn main() {
-    // You can use print statements as follows for debugging, they'll be visible when running tests.
-    println!("Logs from your program will appear here!");
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    let client_socket = UdpSocket::bind("0.0.0.0:53").await?;
+    let client_socket_ref = Arc::new(client_socket);
 
-    let args: Vec<String> = env::args().collect();
+    let resolver_socket = UdpSocket::bind("0.0.0.0:0").await?;
+    let resolver_socket_ref = Arc::new(resolver_socket);
 
-    let mut command = String::from("");
-    let mut resolver = String::from("1.1.1.1:53");
+    let cache: Arc<Mutex<HashMap<Question, (Vec<Answer>, Instant)>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let pending: Arc<Mutex<HashMap<u16, (SocketAddr, u16)>>> = Arc::new(Mutex::new(HashMap::new()));
+    let mut transaction_id: u16 = 0;
 
-    if args.len() > 0 {
-        command = args[1].to_string();
-        resolver = args[2].to_string();
-    }
+    let client_socket_clone = client_socket_ref.clone();
+    let resolver_socket_clone = resolver_socket_ref.clone();
+    let pending_clone = pending.clone();
+    let cache_clone = cache.clone();
 
-    let udp_socket = UdpSocket::bind("127.0.0.1:2053").expect("Failed to bind to address");
+    tokio::spawn(async move {
+        let mut buf = [0; 512];
+
+        loop {
+            let (size, source) = resolver_socket_clone.recv_from(&mut buf).await.unwrap();
+            if source.to_string() != "1.1.1.1:53" {
+                continue;
+            }
+
+            let mut packet = DNSPacket::from_bytes(&buf[0..size]);
+
+            for a in packet.answers.iter() {
+                println!("{}", a)
+            }
+
+            let original_packet_id = packet.header.packet_id;
+            let pending_entry = {
+                let mut pending_map = pending_clone.lock().unwrap();
+                pending_map.remove(&original_packet_id)
+            };
+
+            if let Some((forwaridng_address, tid)) = pending_entry {
+                packet.header.packet_id = tid;
+                client_socket_clone
+                    .send_to(&packet.to_bytes(), forwaridng_address)
+                    .await
+                    .unwrap();
+
+                let mut cache = cache_clone.lock().unwrap();
+                let min_ttl = packet.answers.iter().map(|a| a.ttl).min().unwrap_or(300);
+                cache.insert(
+                    packet.questions[0].clone(),
+                    (
+                        packet.answers.clone(),
+                        Instant::now() + Duration::from_secs(min_ttl as u64),
+                    ),
+                );
+            } else {
+                eprintln!("transaction id not found!")
+            }
+        }
+    });
+
     let mut buf = [0; 512];
 
     loop {
-        match udp_socket.recv_from(&mut buf) {
-            Ok((size, source)) => {
-                let packet_bytes = &buf[0..size];
-                
-                match command.as_str() {
-                    "--resolver" => {
-                        // Only process requests from clients (not from the resolver itself, 
-                        // though normally we wouldn't see resolver packets here if we wait for them explicitly)
-                        if source.to_string() != resolver {
-                            let input_packet = DNSPacket::from_bytes(packet_bytes);
-                            
-                            // Split into individual questions
-                            let forwards = input_packet.as_forwards();
-                            let mut all_answers = Vec::new();
-                            
-                            for f in forwards.iter() {
-                                // Send query to resolver
-                                udp_socket
-                                    .send_to(&f.to_bytes(), &resolver)
-                                    .expect("Failed to send to resolver");
-                                
-                                // Wait for response from resolver
-                                let mut res_buf = [0; 512];
-                                loop {
-                                    match udp_socket.recv_from(&mut res_buf) {
-                                        Ok((res_size, res_source)) => {
-                                            if res_source.to_string() == resolver {
-                                                let resolver_response = DNSPacket::from_bytes(&res_buf[0..res_size]);
-                                                all_answers.extend(resolver_response.answers);
-                                                break;
-                                            } else {
-                                                // Ignore packets from other sources while waiting for resolver
-                                                // (In a real server, we would queue them or handle them concurrently)
-                                                println!("Ignored packet from {} while waiting for resolver", res_source);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            eprintln!("Error receiving from resolver: {}", e);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            
-                            // Construct response packet
-                            let mut response_packet = input_packet;
-                            response_packet.header.qr = 1; // Response
-                            response_packet.header.rcode = if response_packet.header.opcode == 0 { 0 } else { 4 };
-                            response_packet.header.ancount = all_answers.len() as u16;
-                            response_packet.header.nscount = 0;
-                            response_packet.header.arcount = 0;
-                            response_packet.answers = all_answers;
-                            
-                            udp_socket
-                                .send_to(&response_packet.to_bytes(), source)
-                                .expect("Failed to send response to client");
-                        }
-                    }
-                    _ => {
-                        println!("Received {} bytes from {}", size, source);
+        let (size, source) = client_socket_ref.recv_from(&mut buf).await?;
 
-                        let input_packet = DNSPacket::from_bytes(packet_bytes);
+        if source.to_string() == "1.1.1.1:53" {
+            continue;
+        }
 
-                        let output_packet = input_packet.with_answers();
+        let mut packet = DNSPacket::from_bytes(&buf[0..size]);
 
-                        let response = output_packet.to_bytes();
+        if packet.questions.len() > 1 {
+            println!(
+                "recieved {} questions; processing only the first...",
+                packet.questions.len()
+            );
+        }
 
-                        udp_socket
-                            .send_to(&response, source)
-                            .expect("Failed to send response");
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("Error receiving data: {}", e);
-                break;
+        let mut cache_ref = cache.lock().unwrap();
+        if let Some((answers, expiry)) = cache_ref.get(&packet.questions[0]) {
+            if *expiry > Instant::now() {
+                packet.answers = answers.clone();
+                packet.header.qr = 1;
+                packet.header.ra = 1;
+                packet.header.ancount = packet.answers.len() as u16;
+                client_socket_ref
+                    .send_to(&packet.to_bytes(), source)
+                    .await?;
+                continue;
+            } else {
+                cache_ref.remove(&packet.questions[0]);
             }
         }
+
+        let original_id = packet.header.packet_id;
+        transaction_id = transaction_id.wrapping_add(1);
+        let new_id = transaction_id;
+
+        {
+            let mut pending_map = pending.lock().unwrap();
+            pending_map.insert(new_id, (source, original_id));
+        }
+
+        packet.header.packet_id = new_id;
+
+        resolver_socket_ref
+            .send_to(&packet.to_bytes(), "1.1.1.1:53")
+            .await
+            .unwrap();
     }
 }
