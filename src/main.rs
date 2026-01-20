@@ -81,11 +81,12 @@ async fn main() -> io::Result<()> {
 
                 let mut cache = cache_clone.lock().unwrap();
                 let min_ttl = packet.answers.iter().map(|a| a.ttl).min().unwrap_or(300);
+                let effective_ttl = std::cmp::max(min_ttl, 300);
                 cache.insert(
                     packet.questions[0].clone(),
                     (
                         packet.answers.clone(),
-                        Instant::now() + Duration::from_secs(min_ttl as u64),
+                        Instant::now() + Duration::from_secs(effective_ttl as u64),
                     ),
                 );
             } else {
@@ -113,24 +114,34 @@ async fn main() -> io::Result<()> {
             );
         }
 
-        let mut cache_ref = cache.lock().unwrap();
-        if let Some((answers, expiry)) = cache_ref.get(&packet.questions[0]) {
-            if *expiry > Instant::now() {
-                CACHE_HITS.inc();
-                timer.observe_duration();
-
-                packet.answers = answers.clone();
-                packet.header.qr = 1;
-                packet.header.ra = 1;
-                packet.header.ancount = packet.answers.len() as u16;
-                client_socket_ref
-                    .send_to(&packet.to_bytes(), source)
-                    .await?;
-                continue;
+        let cached_answers = {
+            let mut cache_ref = cache.lock().unwrap();
+            if let Some((answers, expiry)) = cache_ref.get(&packet.questions[0]) {
+                if *expiry > Instant::now() {
+                    Some(answers.clone())
+                } else {
+                    cache_ref.remove(&packet.questions[0]);
+                    None
+                }
             } else {
-                cache_ref.remove(&packet.questions[0]);
+                None
             }
+        };
+
+        if let Some(answers) = cached_answers {
+            CACHE_HITS.inc();
+            timer.observe_duration();
+
+            packet.answers = answers;
+            packet.header.qr = 1;
+            packet.header.ra = 1;
+            packet.header.ancount = packet.answers.len() as u16;
+            client_socket_ref
+                .send_to(&packet.to_bytes(), source)
+                .await?;
+            continue;
         }
+
         CACHE_MISSES.inc();
 
         let original_id = packet.header.packet_id;
