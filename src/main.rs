@@ -1,3 +1,4 @@
+use crate::blocklist::DNSBlocklist;
 use crate::cache::DNSCache;
 use crate::packet::DNSPacket;
 use lazy_static::lazy_static;
@@ -11,6 +12,7 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use warp::Filter;
 
+mod blocklist;
 mod cache;
 mod packet;
 
@@ -21,6 +23,8 @@ lazy_static! {
         register_counter!("dns_cache_misses", "Number of cache misses").unwrap();
     static ref RESPONSE_TIME: Histogram =
         register_histogram!("dns_response_time_seconds", "Response time in seconds").unwrap();
+    static ref BLOCKED_REQUESTS: Counter =
+        register_counter!("dns_blocked_requests", "Number of blocked DNS requests").unwrap();
 }
 
 async fn run_metrics_server() {
@@ -83,14 +87,41 @@ async fn handle_dns_request(
     cache: Arc<DNSCache>,
     pending: Arc<Mutex<HashMap<u16, (SocketAddr, u16, Instant)>>>,
     transaction_id: Arc<AtomicU16>,
+    blocklist: Arc<DNSBlocklist>,
 ) {
     let timer = RESPONSE_TIME.start_timer();
     let mut packet = DNSPacket::from_bytes(&data);
+
+    if packet.questions.len() == 0 {
+        return;
+    }
+
     if packet.questions.len() > 1 {
         println!(
             "recieved {} questions; processing only the first...",
             packet.questions.len()
         );
+    }
+
+    if blocklist.contains(&packet.questions[0]) {
+        BLOCKED_REQUESTS.inc();
+        timer.observe_duration();
+
+        packet.answers = vec![packet.questions[0].to_blocked_answer()];
+        packet.header.qr = 1;
+        packet.header.ra = 1;
+        packet.header.ancount = packet.answers.len() as u16;
+        packet.header.nscount = 0;
+        packet.header.arcount = 0;
+        packet.authorities = Vec::new();
+        packet.resources = Vec::new();
+
+        if let Err(e) = client_socket.send_to(&packet.to_bytes(), source).await {
+            eprintln!("Failed to send response to client: {}", e);
+        } else {
+            println!("blocked: {}", packet.questions[0]);
+        }
+        return;
     }
 
     let cached_answers = cache.get(&packet.questions[0]);
@@ -145,8 +176,19 @@ async fn cleanup_cache(cache: Arc<DNSCache>) {
 async fn main() -> io::Result<()> {
     tokio::spawn(run_metrics_server());
 
+    let blocklist = Arc::new(DNSBlocklist::new());
+
     let client_socket = UdpSocket::bind("0.0.0.0:53").await?;
     let client_socket_ref = Arc::new(client_socket);
+
+    // Spawn the blocklist update in the background *after* binding sockets
+    // This allows the server to start resolving immediately (needed if we are our own DNS)
+    let blocklist_updater = blocklist.clone();
+    tokio::spawn(async move {
+        // Give the server a moment to spin up
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        blocklist_updater.update().await;
+    });
 
     let resolver_socket = UdpSocket::bind("0.0.0.0:0").await?;
     let resolver_socket_ref = Arc::new(resolver_socket);
@@ -186,6 +228,7 @@ async fn main() -> io::Result<()> {
         let pending_clone = pending.clone();
         let cache_clone = cache.clone();
         let transaction_id_clone = transaction_id.clone();
+        let blocklist_clone = blocklist.clone();
 
         tokio::spawn(handle_dns_request(
             data,
@@ -195,6 +238,7 @@ async fn main() -> io::Result<()> {
             cache_clone,
             pending_clone,
             transaction_id_clone,
+            blocklist_clone,
         ));
     }
 }

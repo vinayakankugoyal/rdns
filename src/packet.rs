@@ -65,6 +65,17 @@ impl Question {
         res.extend_from_slice(&self.class.to_be_bytes());
         res
     }
+
+    pub fn to_blocked_answer(&self) -> Answer {
+        Answer {
+            name: self.name.clone(),
+            tp: self.tp,
+            class: self.class,
+            ttl: 300,
+            length: 4,
+            data: vec![0x00, 0x00, 0x00, 0x00],
+        }
+    }
 }
 
 impl Display for Question {
