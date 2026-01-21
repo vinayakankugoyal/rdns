@@ -129,6 +129,8 @@ pub struct DNSPacket {
     pub header: Header,
     pub questions: Vec<Question>,
     pub answers: Vec<Answer>,
+    pub authorities: Vec<Answer>,
+    pub resources: Vec<Answer>,
 }
 
 #[allow(unused)]
@@ -136,11 +138,15 @@ impl DNSPacket {
     pub fn from_bytes(buf: &[u8]) -> Self {
         let header = Header::new(&buf[0..12]);
         let (questions, offset) = DNSPacket::parse_questions(&buf, 12, header.qdcount);
-        let (answers, _) = DNSPacket::parse_answers(&buf, offset, header.ancount);
+        let (answers, offset) = DNSPacket::parse_answers(&buf, offset, header.ancount);
+        let (authorities, offset) = DNSPacket::parse_answers(&buf, offset, header.nscount);
+        let (resources, _) = DNSPacket::parse_answers(&buf, offset, header.arcount);
         return Self {
             header,
             questions,
             answers,
+            authorities,
+            resources,
         };
     }
 
@@ -150,6 +156,12 @@ impl DNSPacket {
             result.extend_from_slice(&q.to_bytes());
         }
         for a in self.answers.iter() {
+            result.extend_from_slice(&a.to_bytes());
+        }
+        for a in self.authorities.iter() {
+            result.extend_from_slice(&a.to_bytes());
+        }
+        for a in self.resources.iter() {
             result.extend_from_slice(&a.to_bytes());
         }
         return result;
@@ -166,6 +178,8 @@ impl DNSPacket {
                 header,
                 questions,
                 answers: Vec::new(),
+                authorities: Vec::new(),
+                resources: Vec::new(),
             });
         }
         return res;
