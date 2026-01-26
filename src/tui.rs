@@ -9,6 +9,17 @@ use sysinfo::System;
 use tokio::sync::broadcast;
 use crate::{blocklist::DNSBlocklist, metrics};
 
+// Tokyo Night Palette
+const TN_BG: Color = Color::Rgb(26, 27, 38);
+const TN_FG: Color = Color::Rgb(192, 202, 245);
+const TN_RED: Color = Color::Rgb(247, 118, 142);
+const TN_GREEN: Color = Color::Rgb(158, 206, 106);
+const TN_YELLOW: Color = Color::Rgb(224, 175, 104);
+const TN_BLUE: Color = Color::Rgb(122, 162, 247);
+const TN_MAGENTA: Color = Color::Rgb(187, 154, 247);
+const TN_CYAN: Color = Color::Rgb(125, 207, 255);
+const TN_WHITE: Color = Color::Rgb(169, 177, 214);
+
 pub async fn run(
     mut rx: broadcast::Receiver<String>,
     blocklist: Arc<DNSBlocklist>,
@@ -90,6 +101,11 @@ fn ui(
     blocklist: &DNSBlocklist,
     start_time: Instant,
 ) {
+    // Set background color for the whole area
+    let size = f.area();
+    let block = Block::default().style(Style::default().bg(TN_BG));
+    f.render_widget(block, size);
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -126,17 +142,20 @@ fn ui(
         .name("Latency")
         .marker(symbols::Marker::Braille)
         .graph_type(GraphType::Line)
-        .style(Style::default().fg(Color::Cyan))
+        .style(Style::default().fg(TN_CYAN))
         .data(&latencies_data);
 
     let chart = Chart::new(vec![dataset])
-        .block(Block::default().title(format!(" Latency (Avg: {:.1}ms, Max: {:.1}ms) ", avg_latency, max_latency)).borders(Borders::ALL))
+        .block(Block::default()
+            .title(Span::styled(format!(" Latency (Avg: {:.1}ms, Max: {:.1}ms) ", avg_latency, max_latency), Style::default().fg(TN_MAGENTA).add_modifier(Modifier::BOLD)))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(TN_BLUE)))
         .x_axis(Axis::default()
-            .style(Style::default().fg(Color::Gray))
+            .style(Style::default().fg(TN_FG))
             .bounds([0.0, 100.0]))
         .y_axis(Axis::default()
             .title("ms")
-            .style(Style::default().fg(Color::Gray))
+            .style(Style::default().fg(TN_FG))
             .bounds([0.0, max_latency * 1.1])
             .labels(vec![
                 Span::raw("0"),
@@ -158,25 +177,28 @@ fn ui(
 
     let sys_text = vec![
         Line::from(vec![
-            Span::raw("CPU Usage: "),
-            Span::styled(format!("{:.1}%", global_cpu_usage), Style::default().fg(Color::Green)),
+            Span::styled("CPU Usage: ", Style::default().fg(TN_FG)),
+            Span::styled(format!("{:.1}%", global_cpu_usage), Style::default().fg(TN_GREEN)),
         ]),
         Line::from(vec![
-            Span::raw("RAM Usage: "),
-            Span::styled(format!("{}MB / {}MB", memory_used, memory_total), Style::default().fg(Color::Cyan)),
+            Span::styled("RAM Usage: ", Style::default().fg(TN_FG)),
+            Span::styled(format!("{}MB / {}MB", memory_used, memory_total), Style::default().fg(TN_CYAN)),
         ]),
         Line::from(vec![
-            Span::raw("Uptime:    "),
-            Span::styled(uptime_str, Style::default().fg(Color::Yellow)),
+            Span::styled("Uptime:    ", Style::default().fg(TN_FG)),
+            Span::styled(uptime_str, Style::default().fg(TN_YELLOW)),
         ]),
         Line::from(vec![
-            Span::raw("Blocklist: "),
-            Span::styled(format!("{} domains", blocklist.len()), Style::default().fg(Color::Red)),
+            Span::styled("Blocklist: ", Style::default().fg(TN_FG)),
+            Span::styled(format!("{} domains", blocklist.len()), Style::default().fg(TN_RED)),
         ]),
     ];
 
     let sys_block = Paragraph::new(sys_text)
-        .block(Block::default().title(" System Resources ").borders(Borders::ALL));
+        .block(Block::default()
+            .title(Span::styled(" System Resources ", Style::default().fg(TN_MAGENTA).add_modifier(Modifier::BOLD)))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(TN_BLUE)));
     f.render_widget(sys_block, top_chunks[0]);
 
     // --- METRICS PANEL ---
@@ -194,25 +216,28 @@ fn ui(
     
     let metrics_text = vec![
         Line::from(vec![
-            Span::raw("Total Queries:  "),
-            Span::styled(format!("{}", total), Style::default().fg(Color::White)),
+            Span::styled("Total Queries:  ", Style::default().fg(TN_FG)),
+            Span::styled(format!("{}", total), Style::default().fg(TN_WHITE)),
         ]),
         Line::from(vec![
-            Span::raw("Cache Hits:     "),
-            Span::styled(format!("{} ({:.1}%)", hits, hit_rate), Style::default().fg(Color::Green)),
+            Span::styled("Cache Hits:     ", Style::default().fg(TN_FG)),
+            Span::styled(format!("{} ({:.1}%)", hits, hit_rate), Style::default().fg(TN_GREEN)),
         ]),
          Line::from(vec![
-            Span::raw("Cache Misses:   "),
-            Span::styled(format!("{}", misses), Style::default().fg(Color::Yellow)),
+            Span::styled("Cache Misses:   ", Style::default().fg(TN_FG)),
+            Span::styled(format!("{}", misses), Style::default().fg(TN_YELLOW)),
         ]),
         Line::from(vec![
-            Span::raw("Blocked:        "),
-            Span::styled(format!("{}", blocked), Style::default().fg(Color::Red)),
+            Span::styled("Blocked:        ", Style::default().fg(TN_FG)),
+            Span::styled(format!("{}", blocked), Style::default().fg(TN_RED)),
         ]),
     ];
 
     let metrics_block = Paragraph::new(metrics_text)
-        .block(Block::default().title(" DNS Metrics ").borders(Borders::ALL));
+        .block(Block::default()
+            .title(Span::styled(" DNS Metrics ", Style::default().fg(TN_MAGENTA).add_modifier(Modifier::BOLD)))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(TN_BLUE)));
     f.render_widget(metrics_block, top_chunks[1]);
 
 
@@ -224,11 +249,11 @@ fn ui(
         // Let's just take the last N items.
         .map(|m| {
             let style = if m.contains("BLOCKED") {
-                Style::default().fg(Color::Red)
+                Style::default().fg(TN_RED)
             } else if m.contains("CACHE HIT") {
-                Style::default().fg(Color::Green)
+                Style::default().fg(TN_GREEN)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(TN_FG)
             };
             ListItem::new(Line::from(Span::styled(m, style)))
         })
@@ -240,7 +265,10 @@ fn ui(
     // We already sliced logs to 50 max.
     
     let logs_list = List::new(logs_items)
-        .block(Block::default().title(" Live Query Log ").borders(Borders::ALL));
+        .block(Block::default()
+            .title(Span::styled(" Live Query Log ", Style::default().fg(TN_MAGENTA).add_modifier(Modifier::BOLD)))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(TN_BLUE)));
     
     f.render_widget(logs_list, chunks[2]);
 }

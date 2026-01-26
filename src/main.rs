@@ -39,7 +39,7 @@ async fn run_metrics_server() {
         encoder.encode(&prometheus::gather(), &mut buffer).unwrap();
         String::from_utf8(buffer).unwrap()
     });
-    warp::serve(metrics_route).run(([0, 0, 0, 0], 3032)).await;
+    warp::serve(metrics_route).run(([0, 0, 0, 0], 3030)).await;
 }
 
 async fn process_resolver_responses(
