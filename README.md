@@ -1,6 +1,6 @@
-# rDNS: The "Really? Do Not Search (that)" Name Server 🛑👀
+# rDNS
 
-Welcome to `rdns`, the artisanal, hand-crafted, free-range DNS resolver you never knew you needed. Because relying on your ISP's DNS is so 2005, and trusting Google with *all* your queries is... a choice.
+Welcome to `rdns`, the artisanal, hand-crafted, free-range DNS resolver you never knew you needed. Because relying on your ISP's DNS is so 2005.
 
 ## What is this? 🤔
 
