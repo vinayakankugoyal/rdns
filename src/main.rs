@@ -1,4 +1,5 @@
 use chrono::Local;
+use clap::Parser;
 use crate::blocklist::DNSBlocklist;
 use crate::cache::DNSCache;
 use crate::packet::DNSPacket;
@@ -18,6 +19,18 @@ mod metrics;
 mod packet;
 mod tui;
 
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Address of the upstream DNS resolver
+    #[arg(short, long, default_value = "1.1.1.1:53")]
+    resolver: String,
+
+    /// Port to listen on for DNS requests
+    #[arg(short, long, default_value_t = 53)]
+    port: u16,
+}
+
 async fn run_metrics_server() {
     let metrics_route = warp::path("metrics").and(warp::get()).map(|| {
         use prometheus::Encoder;
@@ -35,12 +48,13 @@ async fn process_resolver_responses(
     pending: Arc<Mutex<HashMap<u16, (SocketAddr, u16, Instant)>>>,
     cache: Arc<DNSCache>,
     log_tx: broadcast::Sender<String>,
+    resolver_addr: String,
 ) {
     let mut buf = [0; 512];
 
     loop {
         let (size, source) = resolver_socket.recv_from(&mut buf).await.unwrap();
-        if source.to_string() != "1.1.1.1:53" {
+        if source.to_string() != resolver_addr {
             continue;
         }
 
@@ -89,6 +103,7 @@ async fn handle_dns_request(
     transaction_id: Arc<AtomicU16>,
     blocklist: Arc<DNSBlocklist>,
     log_tx: broadcast::Sender<String>,
+    resolver_addr: String,
 ) {
     let start = Instant::now();
     let _timer = metrics::RESPONSE_TIME.start_timer();
@@ -168,7 +183,7 @@ async fn handle_dns_request(
     packet.header.packet_id = new_id;
 
     if let Err(e) = resolver_socket
-        .send_to(&packet.to_bytes(), "1.1.1.1:53")
+        .send_to(&packet.to_bytes(), &resolver_addr)
         .await
     {
          let _ = log_tx.send(format!("Failed to forward request: {}", e));
@@ -184,6 +199,8 @@ async fn cleanup_cache(cache: Arc<DNSCache>) {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    let args = Args::parse();
+
     // Channel for log messages
     let (log_tx, _) = broadcast::channel(100);
 
@@ -191,7 +208,7 @@ async fn main() -> io::Result<()> {
 
     let blocklist = Arc::new(DNSBlocklist::new());
 
-    let client_socket = UdpSocket::bind("0.0.0.0:53").await?;
+    let client_socket = UdpSocket::bind(format!("0.0.0.0:{}", args.port)).await?;
     let client_socket_ref = Arc::new(client_socket);
 
     let blocklist_updater = blocklist.clone();
@@ -213,6 +230,7 @@ async fn main() -> io::Result<()> {
     let pending_clone = pending.clone();
     let cache_clone = cache.clone();
     let log_tx_clone = log_tx.clone();
+    let resolver_addr = args.resolver.clone();
 
     tokio::spawn(process_resolver_responses(
         resolver_socket_clone,
@@ -220,6 +238,7 @@ async fn main() -> io::Result<()> {
         pending_clone,
         cache_clone,
         log_tx_clone,
+        resolver_addr,
     ));
 
     let cache_cleanup = cache.clone();
@@ -242,7 +261,7 @@ async fn main() -> io::Result<()> {
     loop {
         let (size, source) = client_socket_ref.recv_from(&mut buf).await?;
 
-        if source.to_string() == "1.1.1.1:53" {
+        if source.to_string() == args.resolver {
             continue;
         }
 
@@ -254,6 +273,7 @@ async fn main() -> io::Result<()> {
         let transaction_id_clone = transaction_id.clone();
         let blocklist_clone = blocklist.clone();
         let log_tx_clone = log_tx.clone();
+        let resolver_addr = args.resolver.clone();
 
         tokio::spawn(handle_dns_request(
             data,
@@ -265,6 +285,7 @@ async fn main() -> io::Result<()> {
             transaction_id_clone,
             blocklist_clone,
             log_tx_clone,
+            resolver_addr,
         ));
     }
 }
