@@ -1,8 +1,7 @@
+use chrono::Local;
 use crate::blocklist::DNSBlocklist;
 use crate::cache::DNSCache;
 use crate::packet::DNSPacket;
-use lazy_static::lazy_static;
-use prometheus::{Counter, Histogram, register_counter, register_histogram};
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -10,22 +9,14 @@ use std::sync::atomic::AtomicU16;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
+use tokio::sync::broadcast;
 use warp::Filter;
 
 mod blocklist;
 mod cache;
+mod metrics;
 mod packet;
-
-lazy_static! {
-    static ref CACHE_HITS: Counter =
-        register_counter!("dns_cache_hits", "Number of cache hits").unwrap();
-    static ref CACHE_MISSES: Counter =
-        register_counter!("dns_cache_misses", "Number of cache misses").unwrap();
-    static ref RESPONSE_TIME: Histogram =
-        register_histogram!("dns_response_time_seconds", "Response time in seconds").unwrap();
-    static ref BLOCKED_REQUESTS: Counter =
-        register_counter!("dns_blocked_requests", "Number of blocked DNS requests").unwrap();
-}
+mod tui;
 
 async fn run_metrics_server() {
     let metrics_route = warp::path("metrics").and(warp::get()).map(|| {
@@ -35,7 +26,7 @@ async fn run_metrics_server() {
         encoder.encode(&prometheus::gather(), &mut buffer).unwrap();
         String::from_utf8(buffer).unwrap()
     });
-    warp::serve(metrics_route).run(([0, 0, 0, 0], 3030)).await;
+    warp::serve(metrics_route).run(([0, 0, 0, 0], 3032)).await;
 }
 
 async fn process_resolver_responses(
@@ -43,6 +34,7 @@ async fn process_resolver_responses(
     client_socket: Arc<UdpSocket>,
     pending: Arc<Mutex<HashMap<u16, (SocketAddr, u16, Instant)>>>,
     cache: Arc<DNSCache>,
+    log_tx: broadcast::Sender<String>,
 ) {
     let mut buf = [0; 512];
 
@@ -54,10 +46,6 @@ async fn process_resolver_responses(
 
         let mut packet = DNSPacket::from_bytes(&buf[0..size]);
 
-        for a in packet.answers.iter() {
-            println!("{}", a)
-        }
-
         let original_packet_id = packet.header.packet_id;
         let pending_entry = {
             let mut pending_map = pending.lock().unwrap();
@@ -65,16 +53,28 @@ async fn process_resolver_responses(
         };
 
         if let Some((forwaridng_address, tid, start_time)) = pending_entry {
-            RESPONSE_TIME.observe(start_time.elapsed().as_secs_f64());
+            let latency = start_time.elapsed();
+            metrics::RESPONSE_TIME.observe(latency.as_secs_f64());
+            metrics::record_latency(latency.as_millis() as u64);
             packet.header.packet_id = tid;
             client_socket
                 .send_to(&packet.to_bytes(), forwaridng_address)
                 .await
                 .unwrap();
 
-            cache.insert(packet.questions[0].clone(), packet.answers.clone());
+            if !packet.questions.is_empty() {
+                 // Clean up question string for display
+                 let q_name = packet.questions[0].to_string().replace("question=", "");
+                 let timestamp = Local::now().format("%H:%M:%S");
+                 let _ = log_tx.send(format!("[{}] [{}] {} -> FORWARDED ({}ms)", timestamp, forwaridng_address, q_name, start_time.elapsed().as_millis()));
+            }
+
+            if !packet.questions.is_empty() {
+                cache.insert(packet.questions[0].clone(), packet.answers.clone());
+            }
         } else {
-            eprintln!("transaction id not found!")
+             let timestamp = Local::now().format("%H:%M:%S");
+             let _ = log_tx.send(format!("[{}] Transaction ID not found!", timestamp));
         }
     }
 }
@@ -88,24 +88,27 @@ async fn handle_dns_request(
     pending: Arc<Mutex<HashMap<u16, (SocketAddr, u16, Instant)>>>,
     transaction_id: Arc<AtomicU16>,
     blocklist: Arc<DNSBlocklist>,
+    log_tx: broadcast::Sender<String>,
 ) {
-    let timer = RESPONSE_TIME.start_timer();
+    let start = Instant::now();
+    let _timer = metrics::RESPONSE_TIME.start_timer();
     let mut packet = DNSPacket::from_bytes(&data);
 
     if packet.questions.len() == 0 {
         return;
     }
 
+    let q_name = packet.questions[0].to_string().replace("question=", "");
+
     if packet.questions.len() > 1 {
-        println!(
-            "recieved {} questions; processing only the first...",
-            packet.questions.len()
-        );
+        let timestamp = Local::now().format("%H:%M:%S");
+        let _ = log_tx.send(format!("[{}] Received {} questions from {}, processing first", timestamp, packet.questions.len(), source));
     }
 
     if blocklist.contains(&packet.questions[0]) {
-        BLOCKED_REQUESTS.inc();
-        timer.observe_duration();
+        metrics::BLOCKED_REQUESTS.inc();
+        let latency = start.elapsed();
+        metrics::record_latency(latency.as_millis() as u64);
 
         packet.answers = vec![packet.questions[0].to_blocked_answer()];
         packet.header.qr = 1;
@@ -117,9 +120,11 @@ async fn handle_dns_request(
         packet.resources = Vec::new();
 
         if let Err(e) = client_socket.send_to(&packet.to_bytes(), source).await {
-            eprintln!("Failed to send response to client: {}", e);
+            let timestamp = Local::now().format("%H:%M:%S");
+            let _ = log_tx.send(format!("[{}] Failed to send blocked response: {}", timestamp, e));
         } else {
-            println!("blocked: {}", packet.questions[0]);
+            let timestamp = Local::now().format("%H:%M:%S");
+            let _ = log_tx.send(format!("[{}] [{}] {} -> BLOCKED", timestamp, source, q_name));
         }
         return;
     }
@@ -127,8 +132,9 @@ async fn handle_dns_request(
     let cached_answers = cache.get(&packet.questions[0]);
 
     if let Some(answers) = cached_answers {
-        CACHE_HITS.inc();
-        timer.observe_duration();
+        metrics::CACHE_HITS.inc();
+        let latency = start.elapsed();
+        metrics::record_latency(latency.as_millis() as u64);
 
         packet.answers = answers;
         packet.header.qr = 1;
@@ -140,12 +146,16 @@ async fn handle_dns_request(
         packet.resources = Vec::new();
 
         if let Err(e) = client_socket.send_to(&packet.to_bytes(), source).await {
-            eprintln!("Failed to send response to client: {}", e);
+             let timestamp = Local::now().format("%H:%M:%S");
+             let _ = log_tx.send(format!("[{}] Failed to send cached response: {}", timestamp, e));
+        } else {
+             let timestamp = Local::now().format("%H:%M:%S");
+             let _ = log_tx.send(format!("[{}] [{}] {} -> CACHE HIT ({}µs)", timestamp, source, q_name, latency.as_micros()));
         }
         return;
     }
 
-    CACHE_MISSES.inc();
+    metrics::CACHE_MISSES.inc();
 
     let original_id = packet.header.packet_id;
     let new_id = transaction_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -161,7 +171,7 @@ async fn handle_dns_request(
         .send_to(&packet.to_bytes(), "1.1.1.1:53")
         .await
     {
-        eprintln!("Failed to forward request to resolver: {}", e);
+         let _ = log_tx.send(format!("Failed to forward request: {}", e));
     }
 }
 
@@ -174,6 +184,9 @@ async fn cleanup_cache(cache: Arc<DNSCache>) {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    // Channel for log messages
+    let (log_tx, _) = broadcast::channel(100);
+
     tokio::spawn(run_metrics_server());
 
     let blocklist = Arc::new(DNSBlocklist::new());
@@ -181,11 +194,8 @@ async fn main() -> io::Result<()> {
     let client_socket = UdpSocket::bind("0.0.0.0:53").await?;
     let client_socket_ref = Arc::new(client_socket);
 
-    // Spawn the blocklist update in the background *after* binding sockets
-    // This allows the server to start resolving immediately (needed if we are our own DNS)
     let blocklist_updater = blocklist.clone();
     tokio::spawn(async move {
-        // Give the server a moment to spin up
         tokio::time::sleep(Duration::from_millis(500)).await;
         blocklist_updater.update().await;
     });
@@ -202,16 +212,30 @@ async fn main() -> io::Result<()> {
     let resolver_socket_clone = resolver_socket_ref.clone();
     let pending_clone = pending.clone();
     let cache_clone = cache.clone();
+    let log_tx_clone = log_tx.clone();
 
     tokio::spawn(process_resolver_responses(
         resolver_socket_clone,
         client_socket_clone,
         pending_clone,
         cache_clone,
+        log_tx_clone,
     ));
 
     let cache_cleanup = cache.clone();
     tokio::spawn(cleanup_cache(cache_cleanup));
+
+    // Spawn TUI
+    let tui_blocklist = blocklist.clone();
+    let tui_rx = log_tx.subscribe();
+    tokio::spawn(async move {
+        if let Err(e) = tui::run(tui_rx, tui_blocklist).await {
+            eprintln!("TUI error: {}", e);
+        }
+        // If TUI exits (user pressed 'q'), we might want to shutdown the whole app.
+        // For now, let's just exit the process.
+        std::process::exit(0);
+    });
 
     let mut buf = [0; 512];
 
@@ -229,6 +253,7 @@ async fn main() -> io::Result<()> {
         let cache_clone = cache.clone();
         let transaction_id_clone = transaction_id.clone();
         let blocklist_clone = blocklist.clone();
+        let log_tx_clone = log_tx.clone();
 
         tokio::spawn(handle_dns_request(
             data,
@@ -239,6 +264,7 @@ async fn main() -> io::Result<()> {
             pending_clone,
             transaction_id_clone,
             blocklist_clone,
+            log_tx_clone,
         ));
     }
 }
