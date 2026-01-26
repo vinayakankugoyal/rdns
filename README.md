@@ -1,6 +1,6 @@
-# rDNS
+# rDNS: The "Really? Do Not Search (that)" Name Server 🛑👀
 
-Welcome to `rdns`, the artisanal, hand-crafted, free-range DNS resolver you never knew you needed. Because relying on your ISP's DNS is so 2005.
+Welcome to `rdns`, the artisanal, hand-crafted, free-range DNS resolver you never knew you needed. Because relying on your ISP's DNS is so 2005, and trusting Google with *all* your queries is... a choice.
 
 ## What is this? 🤔
 
@@ -39,6 +39,12 @@ It's like a bouncer for your internet traffic, but written in Rust so it's *memo
 3.  **Point your DNS to it:**
     Change your computer's DNS settings to `127.0.0.1`.
     *Warning: If you break your internet, don't call us. We're probably debugging a borrow checker error.*
+
+## The "I just want to see the pretty colors" Mode 🎨
+
+Run the binary and marvel at the TUI. It shows logs, blocklist stats, and other things that make you feel like you're controlling the matrix.
+
+![rDNS TUI](tui.png)
 
 ## Contributing 🤝
 
