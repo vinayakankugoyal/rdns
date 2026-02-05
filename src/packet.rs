@@ -252,7 +252,24 @@ impl DNSPacket {
             let length = u16::from_be_bytes([buf[offset + 8], buf[offset + 9]]);
             offset += 10;
 
-            let data = buf[offset..offset + length as usize].to_vec();
+            // Record types that contain domain names which may use compression:
+            // CNAME (5), NS (2), PTR (12), MX (15), SOA (6)
+            // These need to be decompressed to avoid invalid pointers when cached
+            let data = match tp {
+                2 | 5 | 12 => {
+                    // NS, CNAME, PTR: data is a single domain name
+                    let (decompressed_name, _) = Self::qname(buf, offset);
+                    decompressed_name
+                }
+                15 => {
+                    // MX: 2-byte preference + domain name
+                    let mut mx_data = buf[offset..offset + 2].to_vec();
+                    let (decompressed_name, _) = Self::qname(buf, offset + 2);
+                    mx_data.extend_from_slice(&decompressed_name);
+                    mx_data
+                }
+                _ => buf[offset..offset + length as usize].to_vec(),
+            };
 
             offset += length as usize;
 
@@ -261,7 +278,7 @@ impl DNSPacket {
                 tp,
                 class,
                 ttl,
-                length,
+                length: data.len() as u16,
                 data,
             });
         }
