@@ -29,6 +29,10 @@ struct Args {
     /// Port to listen on for DNS requests
     #[arg(short, long, default_value_t = 53)]
     port: u16,
+
+    /// Disable the TUI and run in headless mode
+    #[arg(long, default_value_t = false)]
+    no_tui: bool,
 }
 
 async fn run_metrics_server() {
@@ -244,17 +248,19 @@ async fn main() -> io::Result<()> {
     let cache_cleanup = cache.clone();
     tokio::spawn(cleanup_cache(cache_cleanup));
 
-    // Spawn TUI
-    let tui_blocklist = blocklist.clone();
-    let tui_rx = log_tx.subscribe();
-    tokio::spawn(async move {
-        if let Err(e) = tui::run(tui_rx, tui_blocklist).await {
-            eprintln!("TUI error: {}", e);
-        }
-        // If TUI exits (user pressed 'q'), we might want to shutdown the whole app.
-        // For now, let's just exit the process.
-        std::process::exit(0);
-    });
+    // Spawn TUI only if not disabled
+    if !args.no_tui {
+        let tui_blocklist = blocklist.clone();
+        let tui_rx = log_tx.subscribe();
+        tokio::spawn(async move {
+            if let Err(e) = tui::run(tui_rx, tui_blocklist).await {
+                eprintln!("TUI error: {}", e);
+            }
+            // If TUI exits (user pressed 'q'), we might want to shutdown the whole app.
+            // For now, let's just exit the process.
+            std::process::exit(0);
+        });
+    }
 
     let mut buf = [0; 512];
 
