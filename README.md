@@ -36,6 +36,12 @@ It's like a bouncer for your internet traffic, but written in Rust so it's *memo
     ./target/release/rdns --port 5353 --resolver 8.8.8.8:53
     ```
 
+    **Headless Mode:**
+    Don't need the fancy TUI? Run it in headless mode:
+    ```bash
+    sudo ./target/release/rdns --no-tui
+    ```
+
 3.  **Point your DNS to it:**
     Change your computer's DNS settings to `127.0.0.1`.
     *Warning: If you break your internet, don't call us. We're probably debugging a borrow checker error.*
