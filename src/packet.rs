@@ -200,8 +200,18 @@ impl DNSPacket {
         let mut name: Vec<u8> = Vec::new();
         let mut n = start;
         loop {
+            // Check bounds before accessing buf[n]
+            if n >= buf.len() {
+                // Malformed packet, return what we have
+                return (name, n - start);
+            }
+
             let b = buf[n];
             if (b & 0b11000000) == 0b11000000 {
+                // Check bounds for pointer (needs 2 bytes)
+                if n + 1 >= buf.len() {
+                    return (name, n - start);
+                }
                 let new_start = (((b as u16) & 0x3f) << 8) | (buf[n + 1] as u16);
                 let (common, _) = Self::qname(&buf, new_start as usize);
                 name.extend_from_slice(&common);
@@ -216,6 +226,13 @@ impl DNSPacket {
 
             name.push(b);
             let len = b as usize;
+
+            // Check bounds before reading the label
+            if n + 1 + len > buf.len() {
+                // Malformed packet, return what we have
+                return (name, n - start);
+            }
+
             name.extend_from_slice(&buf[n + 1..n + 1 + len]);
             n = n + 1 + len;
         }
