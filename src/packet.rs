@@ -243,6 +243,10 @@ impl DNSPacket {
         for _ in 0..count {
             let (name, advance) = Self::qname(buf, offset);
             offset += advance;
+            // Need 4 bytes for type + class; bail on a truncated packet.
+            if offset + 4 > buf.len() {
+                break;
+            }
             questions.push(Question {
                 name,
                 tp: u16::from_be_bytes([buf[offset], buf[offset + 1]]),
@@ -258,6 +262,10 @@ impl DNSPacket {
         for _ in 0..count {
             let (name, advance) = Self::qname(buf, offset);
             offset += advance;
+            // Need 10 bytes for type + class + ttl + rdlength; bail on a truncated packet.
+            if offset + 10 > buf.len() {
+                break;
+            }
             let tp = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
             let class = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]);
             let ttl = u32::from_be_bytes([
@@ -269,6 +277,11 @@ impl DNSPacket {
             let length = u16::from_be_bytes([buf[offset + 8], buf[offset + 9]]);
             offset += 10;
 
+            // The record data must fit within the buffer.
+            if offset + length as usize > buf.len() {
+                break;
+            }
+
             // Record types that contain domain names which may use compression:
             // CNAME (5), NS (2), PTR (12), MX (15), SOA (6)
             // These need to be decompressed to avoid invalid pointers when cached
@@ -278,7 +291,7 @@ impl DNSPacket {
                     let (decompressed_name, _) = Self::qname(buf, offset);
                     decompressed_name
                 }
-                15 => {
+                15 if length >= 2 => {
                     // MX: 2-byte preference + domain name
                     let mut mx_data = buf[offset..offset + 2].to_vec();
                     let (decompressed_name, _) = Self::qname(buf, offset + 2);
