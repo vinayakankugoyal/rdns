@@ -1,55 +1,54 @@
-use std::{
-    collections::HashSet,
-    sync::{Arc, RwLock},
-};
+//! Domain blocklist sourced from a hosts-file style URL.
 
-use crate::packet::Question;
+use std::{collections::HashSet, sync::RwLock};
 
+/// URL of the hosts-format blocklist to download.
+const BLOCKLIST_URL: &str = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts";
+
+/// A thread-safe set of blocked domain names.
 pub struct DNSBlocklist {
-    store: Arc<RwLock<HashSet<String>>>,
+    store: RwLock<HashSet<String>>,
 }
 
 impl DNSBlocklist {
     pub fn new() -> Self {
         Self {
-            store: Arc::new(RwLock::new(HashSet::new())),
+            store: RwLock::new(HashSet::new()),
         }
     }
 
-    pub async fn update(&self) {
-        let url = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts";
+    /// Downloads the blocklist and replaces the current set of domains.
+    ///
+    /// Returns the number of domains loaded.
+    pub async fn update(&self) -> Result<usize, reqwest::Error> {
+        let body = reqwest::get(BLOCKLIST_URL).await?.text().await?;
 
-        match reqwest::get(url).await {
-            Ok(res) => {
-                if let Ok(body) = res.text().await {
-                    let mut new_domains = HashSet::new();
-                    for line in body.lines() {
-                        let line = line.trim();
-                        if line.is_empty() || line.starts_with('#') {
-                            continue;
-                        }
-                        // Hosts file format: 0.0.0.0 domain.com
-                        let parts: Vec<&str> = line.split_whitespace().collect();
-                        if parts.len() >= 2 && parts[0] == "0.0.0.0" {
-                            new_domains.insert(parts[1].to_string());
-                        }
-                    }
-                    let mut store = self.store.write().unwrap();
-                    *store = new_domains;
+        let new_domains: HashSet<String> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .filter_map(|line| {
+                // Hosts file format: `0.0.0.0 domain.com`
+                let mut parts = line.split_whitespace();
+                match (parts.next(), parts.next()) {
+                    (Some("0.0.0.0"), Some(domain)) => Some(domain.to_string()),
+                    _ => None,
                 }
-            }
-            Err(_) => {
-            }
-        }
+            })
+            .collect();
+
+        let count = new_domains.len();
+        *self.store.write().unwrap() = new_domains;
+        Ok(count)
     }
 
-    pub fn contains(&self, q: &Question) -> bool {
-        let blocklist = self.store.read().unwrap();
-        return blocklist.contains(&q.to_string().replace("question=", ""));
+    /// Returns whether `domain` (dotted presentation form) is blocked.
+    pub fn contains(&self, domain: &str) -> bool {
+        self.store.read().unwrap().contains(domain)
     }
 
+    /// Returns the number of blocked domains.
     pub fn len(&self) -> usize {
-        let blocklist = self.store.read().unwrap();
-        blocklist.len()
+        self.store.read().unwrap().len()
     }
 }
