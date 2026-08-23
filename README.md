@@ -46,6 +46,46 @@ It's like a bouncer for your internet traffic, but written in Rust so it's *memo
     Change your computer's DNS settings to `127.0.0.1`.
     *Warning: If you break your internet, don't call us. We're probably debugging a borrow checker error.*
 
+## Nix ❄️
+
+For those who have ascended beyond mere package managers, `rdns` is a flake.
+
+*   **Run it without installing anything:**
+    ```bash
+    nix run github:vinayakankugoyal/rdns
+    ```
+
+*   **Install it:**
+    ```bash
+    nix profile install github:vinayakankugoyal/rdns
+    ```
+
+*   **Pin an official release:**
+    ```bash
+    nix run github:vinayakankugoyal/rdns/v0.1.0
+    ```
+
+*   **Hack on it:**
+    ```bash
+    nix develop   # cargo, rustc, rustfmt, clippy, rust-analyzer — all there
+    ```
+
+## Releases 📦
+
+Official versions are cut by tagging. CI builds the flake for Linux
+(x86_64/aarch64) and macOS (aarch64) and publishes the binaries as a GitHub
+release.
+
+1.  Bump `version` in `Cargo.toml` (and commit it).
+2.  Tag and push:
+    ```bash
+    git tag v0.2.0
+    git push origin v0.2.0
+    ```
+3.  That's it. The release workflow refuses to build if the tag doesn't
+    match `Cargo.toml`, so you can't ship a version-number lie even if you
+    try.
+
 ## The "I just want to see the pretty colors" Mode 🎨
 
 Run the binary and marvel at the TUI. It shows logs, blocklist stats, and other things that make you feel like you're controlling the matrix.
