@@ -1,4 +1,22 @@
+//! DNS wire-format parsing and serialization.
+//!
+//! Implements the subset of RFC 1035 needed by the forwarder: header,
+//! question, and resource-record encoding, including decompression of
+//! name pointers in responses.
+
 use std::fmt::Display;
+
+/// DNS record types that embed a (possibly compressed) domain name in RDATA.
+const TYPE_NS: u16 = 2;
+const TYPE_CNAME: u16 = 5;
+const TYPE_MX: u16 = 15;
+const TYPE_PTR: u16 = 12;
+
+/// Size of the fixed DNS header in bytes.
+const HEADER_LEN: usize = 12;
+
+/// TTL (seconds) used for synthesized answers to blocked queries.
+const BLOCKED_TTL: u32 = 300;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Header {
@@ -18,86 +36,92 @@ pub struct Header {
 }
 
 impl Header {
-    pub fn new(buf: &[u8]) -> Self {
-        return Self {
+    fn from_bytes(buf: &[u8]) -> Self {
+        Self {
             packet_id: u16::from_be_bytes([buf[0], buf[1]]),
-            qr: (buf[2] >> 7 & 0x01),
-            opcode: buf[2] >> 3 & 0b00001111,
-            aa: (buf[2] >> 2 & 0x01),
-            tc: (buf[2] >> 1 & 0x01),
-            rd: (buf[2] >> 0 & 0x01),
-            ra: (buf[3] >> 7 & 0x01),
-            z: buf[3] >> 4 & 0b00000111,
-            rcode: buf[3] & 0b00001111,
+            qr: buf[2] >> 7 & 0x01,
+            opcode: buf[2] >> 3 & 0x0f,
+            aa: buf[2] >> 2 & 0x01,
+            tc: buf[2] >> 1 & 0x01,
+            rd: buf[2] & 0x01,
+            ra: buf[3] >> 7 & 0x01,
+            z: buf[3] >> 4 & 0x07,
+            rcode: buf[3] & 0x0f,
             qdcount: u16::from_be_bytes([buf[4], buf[5]]),
             ancount: u16::from_be_bytes([buf[6], buf[7]]),
             nscount: u16::from_be_bytes([buf[8], buf[9]]),
             arcount: u16::from_be_bytes([buf[10], buf[11]]),
-        };
+        }
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut result: Vec<u8> = Vec::new();
-        result.extend_from_slice(&self.packet_id.to_be_bytes());
-        result.extend_from_slice(
-            &(self.qr << 7 | self.opcode << 3 | self.aa << 2 | self.tc << 1 | self.rd)
-                .to_be_bytes(),
-        );
-        result.extend_from_slice(&(self.ra << 7 | self.z << 4 | self.rcode).to_be_bytes());
-        result.extend_from_slice(&self.qdcount.to_be_bytes());
-        result.extend_from_slice(&self.ancount.to_be_bytes());
-        result.extend_from_slice(&self.nscount.to_be_bytes());
-        result.extend_from_slice(&self.arcount.to_be_bytes());
-        result
+    fn write_to(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.packet_id.to_be_bytes());
+        buf.push(self.qr << 7 | self.opcode << 3 | self.aa << 2 | self.tc << 1 | self.rd);
+        buf.push(self.ra << 7 | self.z << 4 | self.rcode);
+        buf.extend_from_slice(&self.qdcount.to_be_bytes());
+        buf.extend_from_slice(&self.ancount.to_be_bytes());
+        buf.extend_from_slice(&self.nscount.to_be_bytes());
+        buf.extend_from_slice(&self.arcount.to_be_bytes());
     }
 }
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct Question {
+    /// Domain name in uncompressed wire format (length-prefixed labels).
     pub name: Vec<u8>,
     pub tp: u16,
     pub class: u16,
 }
+
 impl Question {
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut res = self.name.clone();
-        res.extend_from_slice(&self.tp.to_be_bytes());
-        res.extend_from_slice(&self.class.to_be_bytes());
-        res
+    fn write_to(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.name);
+        buf.extend_from_slice(&self.tp.to_be_bytes());
+        buf.extend_from_slice(&self.class.to_be_bytes());
     }
 
+    /// Synthesizes an answer pointing at 0.0.0.0 for blocklisted queries.
     pub fn to_blocked_answer(&self) -> Answer {
         Answer {
             name: self.name.clone(),
             tp: self.tp,
             class: self.class,
-            ttl: 300,
+            ttl: BLOCKED_TTL,
             length: 4,
-            data: vec![0x00, 0x00, 0x00, 0x00],
+            data: vec![0, 0, 0, 0],
         }
+    }
+
+    /// Returns the domain name in dotted presentation form (e.g. `example.com`).
+    pub fn display_name(&self) -> String {
+        format_name(&self.name)
     }
 }
 
 impl Display for Question {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut n = 0;
-        let mut res: Vec<String> = Vec::new();
-        while n < self.name.len() {
-            let length = self.name[n] as usize;
-            if length == 0 {
-                break;
-            }
-            let label = &self.name[n + 1..n + 1 + length];
-            res.push(String::from_utf8_lossy(&label).into_owned());
-            n = n + 1 + length;
-        }
-
-        write!(f, "question={}", res.join("."))
+        write!(f, "question={}", format_name(&self.name))
     }
+}
+
+/// Renders a wire-format domain name as a dotted string.
+fn format_name(name: &[u8]) -> String {
+    let mut labels: Vec<String> = Vec::new();
+    let mut n = 0;
+    while n < name.len() {
+        let length = name[n] as usize;
+        if length == 0 || n + 1 + length > name.len() {
+            break;
+        }
+        labels.push(String::from_utf8_lossy(&name[n + 1..n + 1 + length]).into_owned());
+        n += 1 + length;
+    }
+    labels.join(".")
 }
 
 #[derive(Debug, Clone)]
 pub struct Answer {
+    /// Domain name in uncompressed wire format (length-prefixed labels).
     pub name: Vec<u8>,
     pub tp: u16,
     pub class: u16,
@@ -107,31 +131,25 @@ pub struct Answer {
 }
 
 impl Answer {
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut result = self.name.clone();
-        result.extend_from_slice(&self.tp.to_be_bytes());
-        result.extend_from_slice(&self.class.to_be_bytes());
-        result.extend_from_slice(&self.ttl.to_be_bytes());
-        result.extend_from_slice(&self.length.to_be_bytes());
-        result.extend_from_slice(&self.data);
-        return result;
+    fn write_to(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.name);
+        buf.extend_from_slice(&self.tp.to_be_bytes());
+        buf.extend_from_slice(&self.class.to_be_bytes());
+        buf.extend_from_slice(&self.ttl.to_be_bytes());
+        buf.extend_from_slice(&self.length.to_be_bytes());
+        buf.extend_from_slice(&self.data);
     }
 }
 
 impl Display for Answer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let question = Question {
-            name: self.name.clone(),
-            tp: self.tp,
-            class: self.class,
-        };
-
-        let mut data_string: Vec<String> = Vec::new();
-        for d in self.data.iter() {
-            data_string.push(format!("{}", d));
-        }
-
-        write!(f, "{}\nanswer={}", question, data_string.join("."))
+        let data: Vec<String> = self.data.iter().map(|d| d.to_string()).collect();
+        write!(
+            f,
+            "question={}\nanswer={}",
+            format_name(&self.name),
+            data.join(".")
+        )
     }
 }
 
@@ -144,78 +162,94 @@ pub struct DNSPacket {
     pub resources: Vec<Answer>,
 }
 
-#[allow(unused)]
 impl DNSPacket {
-    pub fn from_bytes(buf: &[u8]) -> Self {
-        let header = Header::new(&buf[0..12]);
-        let (questions, offset) = DNSPacket::parse_questions(&buf, 12, header.qdcount);
-        let (answers, offset) = DNSPacket::parse_answers(&buf, offset, header.ancount);
-        let (authorities, offset) = DNSPacket::parse_answers(&buf, offset, header.nscount);
-        let (resources, _) = DNSPacket::parse_answers(&buf, offset, header.arcount);
-        return Self {
+    /// Parses a packet from raw bytes.
+    ///
+    /// Returns `None` if the buffer is too short to contain a DNS header.
+    /// Truncated or malformed sections beyond the header yield partial
+    /// results rather than an error.
+    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
+        if buf.len() < HEADER_LEN {
+            return None;
+        }
+        let header = Header::from_bytes(&buf[..HEADER_LEN]);
+        let (questions, offset) = Self::parse_questions(buf, HEADER_LEN, header.qdcount);
+        let (answers, offset) = Self::parse_answers(buf, offset, header.ancount);
+        let (authorities, offset) = Self::parse_answers(buf, offset, header.nscount);
+        let (resources, _) = Self::parse_answers(buf, offset, header.arcount);
+        Some(Self {
             header,
             questions,
             answers,
             authorities,
             resources,
-        };
+        })
     }
 
+    /// Serializes the packet to wire format.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut result = self.header.to_bytes();
-        for q in self.questions.iter() {
-            result.extend_from_slice(&q.to_bytes());
+        let mut buf = Vec::with_capacity(512);
+        self.header.write_to(&mut buf);
+        for q in &self.questions {
+            q.write_to(&mut buf);
         }
-        for a in self.answers.iter() {
-            result.extend_from_slice(&a.to_bytes());
+        for a in self
+            .answers
+            .iter()
+            .chain(&self.authorities)
+            .chain(&self.resources)
+        {
+            a.write_to(&mut buf);
         }
-        for a in self.authorities.iter() {
-            result.extend_from_slice(&a.to_bytes());
-        }
-        for a in self.resources.iter() {
-            result.extend_from_slice(&a.to_bytes());
-        }
-        return result;
+        buf
     }
 
-    pub fn as_forwards(&self) -> Vec<DNSPacket> {
-        let mut res: Vec<DNSPacket> = Vec::new();
-        for q in self.questions.iter() {
-            let mut header = self.header.clone();
-            header.qdcount = 1;
-            let mut questions: Vec<Question> = Vec::new();
-            questions.push(q.clone());
-            res.push(DNSPacket {
-                header,
-                questions,
-                answers: Vec::new(),
-                authorities: Vec::new(),
-                resources: Vec::new(),
-            });
+    /// Serializes a response to this query carrying the given answers,
+    /// without taking ownership of them.
+    ///
+    /// The header is copied from the query with the response flags set and
+    /// authority/additional sections dropped.
+    pub fn response_bytes(&self, answers: &[Answer]) -> Vec<u8> {
+        let mut header = self.header;
+        header.qr = 1;
+        header.ra = 1;
+        header.ancount = answers.len() as u16;
+        header.nscount = 0;
+        header.arcount = 0;
+
+        let mut buf = Vec::with_capacity(512);
+        header.write_to(&mut buf);
+        for q in &self.questions {
+            q.write_to(&mut buf);
         }
-        return res;
+        for a in answers {
+            a.write_to(&mut buf);
+        }
+        buf
     }
 
+    /// Reads a domain name starting at `start`, following compression
+    /// pointers, and returns the uncompressed name along with the number of
+    /// bytes consumed at the original position.
     fn qname(buf: &[u8], start: usize) -> (Vec<u8>, usize) {
         let mut name: Vec<u8> = Vec::new();
         let mut n = start;
         loop {
-            // Check bounds before accessing buf[n]
-            if n >= buf.len() {
-                // Malformed packet, return what we have
+            let Some(&b) = buf.get(n) else {
+                // Truncated packet: return what we have.
                 return (name, n - start);
-            }
+            };
 
-            let b = buf[n];
-            if (b & 0b11000000) == 0b11000000 {
-                // Check bounds for pointer (needs 2 bytes)
-                if n + 1 >= buf.len() {
+            // A pointer (two high bits set) ends the name; the remainder
+            // lives at the 14-bit offset it encodes.
+            if b & 0b1100_0000 == 0b1100_0000 {
+                let Some(&low) = buf.get(n + 1) else {
                     return (name, n - start);
-                }
-                let new_start = (((b as u16) & 0x3f) << 8) | (buf[n + 1] as u16);
-                let (common, _) = Self::qname(&buf, new_start as usize);
-                name.extend_from_slice(&common);
-                // +2 because we also read the offset and the pointer;
+                };
+                let target = ((b as u16 & 0x3f) << 8 | low as u16) as usize;
+                let (suffix, _) = Self::qname(buf, target);
+                name.extend_from_slice(&suffix);
+                // The pointer itself occupies two bytes.
                 return (name, n + 2 - start);
             }
 
@@ -224,22 +258,19 @@ impl DNSPacket {
                 return (name, n + 1 - start);
             }
 
-            name.push(b);
             let len = b as usize;
-
-            // Check bounds before reading the label
             if n + 1 + len > buf.len() {
-                // Malformed packet, return what we have
+                // Truncated label: return what we have.
                 return (name, n - start);
             }
-
+            name.push(b);
             name.extend_from_slice(&buf[n + 1..n + 1 + len]);
-            n = n + 1 + len;
+            n += 1 + len;
         }
     }
 
     fn parse_questions(buf: &[u8], mut offset: usize, count: u16) -> (Vec<Question>, usize) {
-        let mut questions: Vec<Question> = Vec::new();
+        let mut questions = Vec::with_capacity(count as usize);
         for _ in 0..count {
             let (name, advance) = Self::qname(buf, offset);
             offset += advance;
@@ -258,11 +289,12 @@ impl DNSPacket {
     }
 
     fn parse_answers(buf: &[u8], mut offset: usize, count: u16) -> (Vec<Answer>, usize) {
-        let mut answers: Vec<Answer> = Vec::new();
+        let mut answers = Vec::with_capacity(count as usize);
         for _ in 0..count {
             let (name, advance) = Self::qname(buf, offset);
             offset += advance;
-            // Need 10 bytes for type + class + ttl + rdlength; bail on a truncated packet.
+            // Need 10 bytes for type + class + ttl + rdlength; bail on a
+            // truncated packet.
             if offset + 10 > buf.len() {
                 break;
             }
@@ -282,20 +314,19 @@ impl DNSPacket {
                 break;
             }
 
-            // Record types that contain domain names which may use compression:
-            // CNAME (5), NS (2), PTR (12), MX (15), SOA (6)
-            // These need to be decompressed to avoid invalid pointers when cached
+            // Record types whose RDATA contains a domain name must be
+            // decompressed so cached copies don't carry pointers into a
+            // packet that no longer exists.
             let data = match tp {
-                2 | 5 | 12 => {
-                    // NS, CNAME, PTR: data is a single domain name
-                    let (decompressed_name, _) = Self::qname(buf, offset);
-                    decompressed_name
+                TYPE_NS | TYPE_CNAME | TYPE_PTR => {
+                    let (decompressed, _) = Self::qname(buf, offset);
+                    decompressed
                 }
-                15 if length >= 2 => {
-                    // MX: 2-byte preference + domain name
+                TYPE_MX if length >= 2 => {
+                    // MX: 2-byte preference followed by a domain name.
                     let mut mx_data = buf[offset..offset + 2].to_vec();
-                    let (decompressed_name, _) = Self::qname(buf, offset + 2);
-                    mx_data.extend_from_slice(&decompressed_name);
+                    let (decompressed, _) = Self::qname(buf, offset + 2);
+                    mx_data.extend_from_slice(&decompressed);
                     mx_data
                 }
                 _ => buf[offset..offset + length as usize].to_vec(),

@@ -1917,17 +1917,13 @@ dependencies = [
 name = "rdns"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "bytes",
  "chrono",
  "clap",
  "crossterm",
- "lazy_static",
  "prometheus",
  "ratatui",
  "reqwest",
  "sysinfo",
- "thiserror 1.0.63",
  "tokio",
  "warp",
 ]

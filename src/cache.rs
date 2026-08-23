@@ -1,3 +1,5 @@
+//! TTL-based cache for DNS responses.
+
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
@@ -6,49 +8,63 @@ use std::{
 
 use crate::packet::{Answer, Question};
 
+/// Minimum time (seconds) an entry stays cached, regardless of record TTLs.
+const MIN_CACHE_TTL: u32 = 300;
+
+/// TTL assumed for responses that carry no answers.
+const DEFAULT_CACHE_TTL: u32 = 300;
+
 struct CacheEntry {
-    answers: Vec<Answer>,
+    answers: Arc<[Answer]>,
     expiration: Instant,
 }
 
+/// A thread-safe DNS response cache keyed by question.
+///
+/// Answers are stored behind an `Arc` so lookups hand out a cheap reference
+/// instead of cloning every record.
 pub struct DNSCache {
-    store: Arc<RwLock<HashMap<Question, CacheEntry>>>,
+    store: RwLock<HashMap<Question, CacheEntry>>,
 }
 
 impl DNSCache {
     pub fn new() -> Self {
         Self {
-            store: Arc::new(RwLock::new(HashMap::new())),
+            store: RwLock::new(HashMap::new()),
         }
     }
 
-    pub fn get(&self, q: &Question) -> Option<Vec<Answer>> {
+    /// Returns the cached answers for `q`, if present and not expired.
+    pub fn get(&self, q: &Question) -> Option<Arc<[Answer]>> {
         let cache = self.store.read().unwrap();
-        if let Some(entry) = cache.get(q) {
-            if entry.expiration > Instant::now() {
-                return Some(entry.answers.clone());
-            }
-        }
-        None
+        cache
+            .get(q)
+            .filter(|entry| entry.expiration > Instant::now())
+            .map(|entry| Arc::clone(&entry.answers))
     }
 
+    /// Caches `answers` for `q`, expiring after the smallest record TTL
+    /// (clamped to at least [`MIN_CACHE_TTL`]).
     pub fn insert(&self, q: Question, answers: Vec<Answer>) {
-        let mut cache = self.store.write().unwrap();
+        let min_ttl = answers
+            .iter()
+            .map(|a| a.ttl)
+            .min()
+            .unwrap_or(DEFAULT_CACHE_TTL);
+        let effective_ttl = min_ttl.max(MIN_CACHE_TTL);
 
-        let min_ttl = answers.iter().map(|a| a.ttl).min().unwrap_or(300);
-        let effective_ttl = std::cmp::max(min_ttl, 300);
-
-        cache.insert(
-            q,
-            CacheEntry {
-                answers,
-                expiration: Instant::now() + Duration::from_secs(effective_ttl as u64),
-            },
-        );
+        let entry = CacheEntry {
+            answers: answers.into(),
+            expiration: Instant::now() + Duration::from_secs(effective_ttl.into()),
+        };
+        self.store.write().unwrap().insert(q, entry);
     }
 
-    pub fn cleanup(&self, expiration: Instant) {
-        let mut cache = self.store.write().unwrap();
-        cache.retain(|_, entry| entry.expiration > expiration);
+    /// Drops every entry that has expired as of `now`.
+    pub fn cleanup(&self, now: Instant) {
+        self.store
+            .write()
+            .unwrap()
+            .retain(|_, entry| entry.expiration > now);
     }
 }
