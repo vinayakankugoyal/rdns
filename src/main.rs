@@ -29,6 +29,11 @@ const METRICS_PORT: u16 = 3030;
 /// Capacity of the broadcast channel used for log lines.
 const LOG_CHANNEL_CAPACITY: usize = 100;
 
+/// Receive buffer for upstream responses: the largest possible UDP
+/// payload, so no response is ever cut short, whatever EDNS size the
+/// client asked the upstream for.
+const MAX_UPSTREAM_PAYLOAD: usize = 65535;
+
 /// How long to wait for the upstream resolver before answering SERVFAIL.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -104,7 +109,7 @@ impl Server {
         set_id(&mut query, id);
         socket.send(&query).await?;
 
-        let mut buf = vec![0; MAX_UDP_PAYLOAD];
+        let mut buf = vec![0; MAX_UPSTREAM_PAYLOAD];
         let wait_for_answer = async {
             loop {
                 let size = socket.recv(&mut buf).await?;

@@ -164,11 +164,11 @@ scripted upstream resolver and client.
 | ID | Property | Test |
 |----|----------|------|
 | F0 | A forwarded answer reaches the client under the client's own ID, and the next query for the same name, in any case, is served from the cache | `f0_forward_then_cache_hit` |
-| F1 | An upstream datagram is accepted only if it parses, is a response, and matches the query's ID **and** question. Anything else is ignored, never relayed and never cached. Transaction IDs are random. | `f1_mismatched_replies_ignored`, `f1_transaction_ids_are_not_sequential` |
+| F1 | An upstream datagram is accepted only if it parses, is a response, and matches the query's ID **and** question. Anything else is ignored, never relayed and never cached. Transaction IDs are random. | `f1_mismatched_replies_ignored`, `f1_transaction_ids_are_unpredictable` |
 | F2 | Every query is answered: if the upstream stays silent, the client gets SERVFAIL after the timeout. Concurrent queries never share state, so out-of-order answers reach the right clients. | `f2_unanswered_queries_get_servfail`, `f2_concurrent_queries_are_kept_apart` |
 | F3 | Negative answers are replayed from the cache with their RCODE and SOA; error responses are relayed but not cached | `f3_negative_answers_keep_rcode_and_errors_are_not_cached` |
 | F4 | A TC = 1 response is relayed with TC = 1 and not cached | `f4_truncated_responses_relayed_not_cached` |
-| F5 | No client gets a response larger than its UDP limit (E1); a response that would exceed it becomes the truncated form (R3), and clients advertising a larger size get the whole response | `f5_large_responses_respect_client_limit` |
+| F5 | No client gets a response larger than its UDP limit (E1); a response that would exceed it becomes the truncated form (R3), and clients advertising a larger size get the whole response. Upstream replies are read into a 64 KiB buffer, so none is ever cut short, whatever size the client advertised | `f5_large_responses_respect_client_limit` |
 | F6 | A relayed response is byte-for-byte the upstream's apart from the ID, so record types rdns doesn't understand pass through intact | `f6_relay_is_verbatim` |
 | F7 | Blocked names are answered locally, in any case, with a well-typed answer (B1, L2) | `f7_blocking` |
 
@@ -202,9 +202,16 @@ compressed name occupies: `unwrap_or(pos - start)` evaluates
 `pos - start` eagerly, even after a backward pointer has made `pos < start`.
 P1's random inputs and P3's compressed messages each found one.
 
-To check that the tests can actually fail, each fix was reverted one at a
-time and the suite re-run. Every reverted fix was caught by at least one
-property.
+To check that the tests can actually fail, each of the 16 fixes was
+reverted on its own and the suite re-run (mutation testing). The first
+round caught 15 of the 16. The survivor was the switch from a counter to
+random transaction IDs: F1′ then only checked that IDs weren't
+*consecutive*, and other tests running in parallel shared the counter and
+put gaps in the sequence. F1′ now checks that consecutive IDs are far
+apart, which a counter can't satisfy, and all 16 reverts are caught. Two of
+them (disabling the backward-pointer rule, and the 255-byte limit) make
+the parser loop forever. The suite detects this by hanging, which is why
+P1's cycle witnesses run in a child process.
 
 ## What this spec does not cover
 

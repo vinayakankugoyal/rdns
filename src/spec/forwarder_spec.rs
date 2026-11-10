@@ -247,9 +247,13 @@ async fn f1_mismatched_replies_ignored() {
     );
 }
 
-/// F1′. Forwarded transaction IDs are not sequential.
+/// F1′. Forwarded transaction IDs are unpredictable: consecutive IDs are
+/// far apart. For uniformly random IDs, a gap of 256 or less has
+/// probability 513/65536 < 1%, so seeing it in more than half of 31 gaps
+/// is vanishingly unlikely. A counter, even one shared with other
+/// concurrent queries, produces small gaps every time.
 #[tokio::test]
-async fn f1_transaction_ids_are_not_sequential() {
+async fn f1_transaction_ids_are_unpredictable() {
     let h = Harness::new().await;
     let mut ids = Vec::new();
     for i in 0..32 {
@@ -257,10 +261,14 @@ async fn f1_transaction_ids_are_not_sequential() {
             &h.forward(query(0, &format!("q{i}.test"))).await.query,
         ));
     }
-    assert!(
-        ids.windows(2).any(|w| w[1] != w[0].wrapping_add(1)),
-        "IDs are sequential: {ids:?}"
-    );
+    let small_gaps = ids
+        .windows(2)
+        .filter(|w| {
+            let d = w[1].wrapping_sub(w[0]);
+            d.min(d.wrapping_neg()) <= 256
+        })
+        .count();
+    assert!(small_gaps <= 15, "IDs look sequential: {ids:?}");
 }
 
 /// F2. Every query gets an answer: if the upstream never replies, the
@@ -372,15 +380,17 @@ async fn f4_truncated_responses_relayed_not_cached() {
 /// advertise a larger EDNS size get the full response. Regression for #6.
 #[tokio::test]
 async fn f5_large_responses_respect_client_limit() {
-    let n = 40u16; // 40 A records ≈ 650 bytes
-    let body: Vec<u8> = (0..n)
-        .flat_map(|i| a_record(600, [10, 0, 0, i as u8]))
-        .collect();
-
-    for (q, want_full) in [
-        (query(1, "many.test"), false),
-        (edns_query(2, "many.test", 4096), true),
-    ] {
+    // (query, records in the reply, client limit, whole reply fits?)
+    // 40 A records ≈ 650 bytes; 300 ≈ 4.8 KB, more than rdns ever sends.
+    let cases = [
+        (query(1, "many.test"), 40u16, 512, false),
+        (edns_query(2, "many.test", 4096), 40, 4096, true),
+        (edns_query(3, "many.test", 65535), 300, 4096, false),
+    ];
+    for (q, n, limit, fits) in cases {
+        let body: Vec<u8> = (0..n)
+            .flat_map(|i| a_record(600, [10, 0, (i >> 8) as u8, i as u8]))
+            .collect();
         let h = Harness::new().await;
         let up = h.forward(q).await;
         h.reply(
@@ -390,12 +400,12 @@ async fn f5_large_responses_respect_client_limit() {
         .await;
         let r = h.client_recv().await;
         let p = DNSPacket::from_bytes(&r).expect("relayed response must be well formed");
-        if want_full {
+        assert!(r.len() <= limit, "{} bytes > limit {limit}", r.len());
+        if fits {
             assert!(!tc_of(&r));
             assert_eq!(p.answers.len(), n as usize);
         } else {
-            assert!(r.len() <= 512);
-            assert!(tc_of(&r));
+            assert!(tc_of(&r), "{n} records: expected TC");
             assert!(p.answers.is_empty());
         }
     }
