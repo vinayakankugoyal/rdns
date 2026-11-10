@@ -21,6 +21,9 @@ pub const RCODE_NOERROR: u8 = 0;
 pub const RCODE_SERVFAIL: u8 = 2;
 pub const RCODE_NXDOMAIN: u8 = 3;
 
+/// The DO ("DNSSEC OK") bit in an OPT record's TTL field (RFC 3225).
+const OPT_DO: u32 = 0x8000;
+
 /// Size of the fixed DNS header in bytes.
 const HEADER_LEN: usize = 12;
 
@@ -414,6 +417,9 @@ impl DNSPacket {
     /// The header is copied from the query with QR and RA set, the given
     /// RCODE, and counts matching the records written. Every TTL is
     /// reduced by `age` seconds, the time the records spent in the cache.
+    /// If the query has an EDNS OPT record, so does the response (RFC 6891
+    /// §7): version 0, the UDP payload size rdns accepts, and the query's
+    /// DO bit.
     pub fn response_bytes(
         &self,
         rcode: u8,
@@ -430,7 +436,8 @@ impl DNSPacket {
         header.qdcount = self.questions.len() as u16;
         header.ancount = answers.len() as u16;
         header.nscount = authorities.len() as u16;
-        header.arcount = 0;
+        let opt = self.resources.iter().find(|r| r.tp == TYPE_OPT);
+        header.arcount = u16::from(opt.is_some());
 
         let mut buf = Vec::with_capacity(DEFAULT_UDP_PAYLOAD);
         header.write_to(&mut buf);
@@ -439,6 +446,14 @@ impl DNSPacket {
         }
         for a in answers.iter().chain(authorities) {
             a.write_to(&mut buf, age);
+        }
+        if let Some(opt) = opt {
+            buf.push(0); // root owner
+            buf.extend_from_slice(&TYPE_OPT.to_be_bytes());
+            buf.extend_from_slice(&(MAX_UDP_PAYLOAD as u16).to_be_bytes());
+            // Extended RCODE 0, version 0, the DO bit, Z = 0; no options.
+            buf.extend_from_slice(&(opt.ttl & OPT_DO).to_be_bytes());
+            buf.extend_from_slice(&[0, 0]);
         }
         buf
     }

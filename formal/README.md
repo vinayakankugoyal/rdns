@@ -35,6 +35,7 @@ lake build    # checks every proof
 | `readName_wf` (Name) | **P2, first half**: every decoded name is well formed (labels of 1–63 bytes, then the root) and at most 255 bytes |
 | `readName_consumed` (Name) | the bytes a name occupies are ≥ 1 and within the buffer |
 | `no_underflow` (Name) | in every loop state where Rust evaluates `pos + 2 - start` or `pos - start`, `start ≤ pos` |
+| `opt_echoed` (Packet) | **R5**: a synthesized response has an OPT record exactly when the query did (the counterexample until [#23](https://github.com/vinayakankugoyal/rdns/issues/23)) |
 | `r1_response_header` (Packet) | **R1, header part**: QR = 1, TC = AA = 0, the given RCODE, the query's ID |
 | `served_record_never_outlives_ttl` (Cache) | the TTL arithmetic: a record served at age ⌈t⌉ is dropped downstream by `max(t, its own expiry)` |
 | `positive_entries_never_stale` (Cache) | without `--min-cache-ttl`, a NOERROR response with answers is never served after any of its records has expired |
@@ -54,7 +55,6 @@ anything about sockets, timeouts or transaction IDs.
 | `bug_negative_ttl_extended` (Cache) | downstream never holds a negative answer past its negative TTL | [#20](https://github.com/vinayakankugoyal/rdns/issues/20) |
 | `bug_high_bit_ttl_cached` (Cache) | TTLs ≥ 2³¹ count as 0 (RFC 2181 §8) | [#21](https://github.com/vinayakankugoyal/rdns/issues/21) |
 | `bug_opcode_ignored` (Forwarder) | non-QUERY opcodes get NOTIMP | [#22](https://github.com/vinayakankugoyal/rdns/issues/22) |
-| `bug_opt_missing` (Packet) | responses to EDNS queries carry OPT (RFC 6891 §7) | [#23](https://github.com/vinayakankugoyal/rdns/issues/23) |
 | `c3_as_stated_is_false` (Cache) | SPEC.md's C3 as written (the spec overclaims) | [#24](https://github.com/vinayakankugoyal/rdns/issues/24) |
 
 `bug_cache_hit_loses_compression` is the one result with a link the kernel

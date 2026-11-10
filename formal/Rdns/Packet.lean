@@ -153,7 +153,16 @@ def responseHeader (q : Packet) (rcode : UInt8) (nAns nAuth : Nat) : Header :=
     qdcount := UInt16.ofNat q.questions.size
     ancount := UInt16.ofNat nAns
     nscount := UInt16.ofNat nAuth
-    arcount := 0 }
+    arcount := if (q.resources.find? (·.tp = TYPE_OPT)).isSome then 1 else 0 }
+
+/-- The OPT record `response_bytes` appends when the query has one: root
+owner, type 41, class 4096 (`MAX_UDP_PAYLOAD`), TTL = the query's DO bit
+(extended RCODE 0, version 0), no RDATA (#23). -/
+def optRecord (q : Packet) : Bytes :=
+  match q.resources.find? (·.tp = TYPE_OPT) with
+  | some opt => #[0] ++ toBe16 TYPE_OPT ++ toBe16 (UInt16.ofNat MAX_UDP_PAYLOAD)
+      ++ toBe32 (opt.ttl &&& 0x8000) ++ #[0, 0]
+  | none => #[]
 
 /-- `DNSPacket::response_bytes`. -/
 def Packet.responseBytes (q : Packet) (rcode : UInt8) (answers authorities : Array Answer)
@@ -161,6 +170,7 @@ def Packet.responseBytes (q : Packet) (rcode : UInt8) (answers authorities : Arr
   (responseHeader q rcode answers.size authorities.size).toBytes
     ++ (q.questions.foldl (fun acc x => acc ++ x.toBytes) #[])
     ++ ((answers ++ authorities).foldl (fun acc a => acc ++ a.toBytes age) #[])
+    ++ optRecord q
 
 /-- `DNSPacket::truncated_bytes`: `buf[2] |= 0x02`. -/
 def Packet.truncatedBytes (q : Packet) (rcode : UInt8) : Bytes :=
@@ -260,15 +270,32 @@ theorem r1_response_header (q : Packet) (rcode : UInt8) (n m : Nat) :
 "If an OPT record is present in a received request, compliant responders
 MUST include an OPT record in their respective responses." -/
 
-/-- `response_bytes` never writes an additional section. -/
-theorem response_arcount_zero (q : Packet) (rcode : UInt8) (n m : Nat) :
-    (responseHeader q rcode n m).arcount = 0 := rfl
+def Packet.hasOpt (q : Packet) : Bool := (q.resources.find? (·.tp = TYPE_OPT)).isSome
 
-def Packet.hasOpt (q : Packet) : Bool := q.resources.any (·.tp = TYPE_OPT)
+/-- **R5, RFC 6891 §7**, for the responses rdns synthesizes. -/
+def OptEchoed : Prop :=
+  ∀ (q : Packet) (rcode : UInt8) (answers authorities : Array Answer) (age : UInt32),
+    (q.responseBytes rcode answers authorities age)[11]! = if q.hasOpt then 1 else 0
 
-/-- **RFC 6891 §7**, for the responses rdns synthesizes. -/
-def OptEchoed (respond : Packet → Bytes) : Prop :=
-  ∀ q : Packet, q.hasOpt = true → (respond q)[11]! ≠ 0
+theorem Header.toBytes_size (h : Header) : h.toBytes.size = 12 := by
+  simp [Header.toBytes, toBe16]
+
+/-- Byte 11 of anything that starts with a header is ARCOUNT's low byte. -/
+theorem Header.byte11 (h : Header) (rest : Bytes) :
+    (h.toBytes ++ rest)[11]! = UInt8.ofNat (h.arcount.toNat % 256) := by
+  have hs := h.toBytes_size
+  rw [getElem!_pos (h.toBytes ++ rest) 11 (by simp; omega)]
+  rw [Array.getElem_append_left (by omega)]
+  simp [Header.toBytes, toBe16]
+
+/-- Every synthesized response to a query with an OPT record says it has
+one additional record (the OPT record `optRecord` appends), and one to a
+query without OPT says none. Until #23 ARCOUNT was always 0. -/
+theorem opt_echoed : OptEchoed := by
+  intro q rcode answers authorities age
+  simp only [Packet.responseBytes, Array.append_assoc, Header.byte11, responseHeader,
+    Packet.hasOpt]
+  split <;> next h => simp [h]
 
 /-- `dig`'s default query, with its OPT record (UDP size 1232). -/
 def digQueryEdns : Packet :=
@@ -276,11 +303,10 @@ def digQueryEdns : Packet :=
     header := { digQuery.header with arcount := 1 }
     resources := #[{ name := #[0], tp := TYPE_OPT, cls := 1232, ttl := 0, data := #[] }] }
 
-/-- **Counterexample.** A cache hit, blocked answer or SERVFAIL for an EDNS
-query has ARCOUNT = 0. -/
-theorem bug_opt_missing :
-    ¬ OptEchoed (fun q => q.responseBytes RCODE_NOERROR #[] #[] 0) := fun h =>
-  absurd (h digQueryEdns (by decide +kernel)) (by decide +kernel)
+/-- The former counterexample: the response to `dig`'s EDNS query now ends
+in an OPT record. -/
+example : (digQueryEdns.responseBytes RCODE_NOERROR #[] #[] 0).extract 29 40
+    = #[0, 0, 41, 16, 0, 0, 0, 0, 0, 0, 0] := by decide +kernel
 
 /-! ## Cache hits lose name compression
 

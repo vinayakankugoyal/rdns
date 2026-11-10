@@ -435,6 +435,43 @@ fn r1_response_bytes_shape() {
     }
 }
 
+/// R5. A response to a query with an OPT record carries one: root owner,
+/// the UDP size rdns accepts, version 0, and the query's DO bit; a query
+/// without OPT gets none (RFC 6891 §7). Holds for answers, errors and the
+/// truncated form. Regression for #23.
+#[test]
+fn r5_opt_echoed() {
+    for (opt_ttl, has_opt) in [(None, false), (Some(0u32), true), (Some(0x8000), true)] {
+        let mut q = query("example.com", 1);
+        if let Some(ttl) = opt_ttl {
+            q[11] = 1; // ARCOUNT = 1
+            q.extend([0, 0, 41, 0x04, 0xD0]); // root, OPT, payload 1232
+            q.extend(ttl.to_be_bytes());
+            q.extend([0, 0]);
+        }
+        let p = DNSPacket::from_bytes(&q).unwrap();
+        let answers = [p.questions[0].to_blocked_answer().unwrap()];
+        for bytes in [
+            p.response_bytes(RCODE_NOERROR, &answers, &[], 0),
+            p.response_bytes(RCODE_SERVFAIL, &[], &[], 0),
+            p.truncated_bytes(RCODE_NOERROR),
+        ] {
+            let r = DNSPacket::from_bytes(&bytes).expect("response must parse");
+            assert_eq!(r.header.arcount, u16::from(has_opt));
+            match (r.resources.as_slice(), opt_ttl) {
+                ([], None) => {}
+                ([opt], Some(ttl)) => {
+                    assert_eq!((opt.name.as_slice(), opt.tp), (&[0u8][..], TYPE_OPT));
+                    assert_eq!(opt.class as usize, MAX_UDP_PAYLOAD);
+                    assert_eq!(opt.ttl, ttl & 0x8000, "DO not copied, or version/RCODE set");
+                    assert!(opt.data.is_empty());
+                }
+                (rs, _) => panic!("unexpected additional section {rs:?}"),
+            }
+        }
+    }
+}
+
 #[test]
 fn r2_ttls_are_aged() {
     let p = DNSPacket::from_bytes(&query("example.com", 1)).unwrap();

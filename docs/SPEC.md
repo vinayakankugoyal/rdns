@@ -123,7 +123,7 @@ lexicographically at every step), so the argument is machine-checked.
 | R2 | Each served TTL is `ttl(r) ⊖ age`, where `⊖` is subtraction saturating at 0 | exhaustive over ages 0–700, plus `u32::MAX` | `r2_ttls_are_aged` |
 | R3 | The truncated form of a response is TC = 1 with the question and no records (RFC 2181 §9) | witness | `r3_truncated_bytes_shape` |
 | R4 | **✗** [#15](https://github.com/vinayakankugoyal/rdns/issues/15) A synthesized response never has AD or Z set; CD is copied from the query (RFC 4035 §3.2.2, §3.2.3; RFC 1035 §4.1.1). rdns validates nothing, so it must not claim AD | refuted | [`bug_ad_bit_forged`](../formal/Rdns/Packet.lean) |
-| R5 | **✗** [#23](https://github.com/vinayakankugoyal/rdns/issues/23) A response to a query with an OPT record carries an OPT record (RFC 6891 §7) | refuted | [`bug_opt_missing`](../formal/Rdns/Packet.lean) |
+| R5 | A response to a query with an OPT record carries an OPT record (RFC 6891 §7): root owner, the UDP size rdns accepts, version 0, the query's DO bit; a query without OPT gets none. Regression for [#23](https://github.com/vinayakankugoyal/rdns/issues/23) | **proof** of ARCOUNT for every query ([`opt_echoed`](../formal/Rdns/Packet.lean)) + witness for the record itself, for answers, errors and the truncated form | `r5_opt_echoed` |
 | R6 | **✗** [#17](https://github.com/vinayakankugoyal/rdns/issues/17) A response served from the cache is no larger than the relayed response it was built from, apart from TTLs, so a client that got the relayed answer also gets the cached one (needs name compression) | refuted (295 bytes relayed, 825 cached) | [`bug_cache_hit_loses_compression`](../formal/Rdns/Packet.lean) |
 
 ## 3. Cache
