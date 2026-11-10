@@ -12,19 +12,34 @@ stores `packet.questions.first()`: name, type and class. Nothing in the
 query header is part of the key, in particular not the CD
 ("checking disabled") bit.
 
-RFC 4035 §3.2.2 / §4.7 and RFC 6840 §5.9: a client sets CD = 1 to ask a
-validating resolver *not* to validate, and to hand back data even when its
-DNSSEC is broken. The upstream rdns uses by default, 1.1.1.1, validates.
-So with CD = 0 it answers SERVFAIL for a name whose signatures don't
-check out, and with CD = 1 it answers with the (unvalidated) data. A
-caching forwarder must not serve data it got with CD = 1 to a client that
-sent CD = 0 (RFC 6840 §5.9).
+RFC 4035 §3.2.2: by setting CD = 1, "the originating resolver has
+indicated that it takes responsibility for performing its own
+authentication", and the validating server returns the data "even if [its]
+local authentication policy would reject the records". The upstream rdns
+uses by default, 1.1.1.1, validates: for a name whose signatures don't
+check out (e.g. `dnssec-failed.org`) it answers SERVFAIL with CD = 0 and
+the unvalidated data with CD = 1. rdns doesn't validate, so the upstream's
+check is the only one its clients get; caching the CD = 1 answer under the
+same key hands that data to clients that never took responsibility for
+it.
+
+(RFC 6840 §5.9 says a validating cache needn't track CD, because it
+validates cached data itself. rdns is not a validating cache.)
 -/
 
 namespace Rdns
 
 /-- The CD bit: bit 4 of byte 3, the low bit of Rust's `z`. -/
 def Header.cd (h : Header) : Bool := h.z &&& 0x01 = 0x01
+
+/-- ASCII lowercase, as `to_ascii_lowercase`. -/
+def asciiLower (b : UInt8) : UInt8 := if 65 ≤ b ∧ b ≤ 90 then b + 32 else b
+
+/-- `Question`'s `PartialEq`: type, class, and the name compared with
+`eq_ignore_ascii_case` (same length, bytes equal after lowercasing). -/
+def Question.same (a b : Question) : Bool :=
+  a.tp == b.tp && a.cls == b.cls && a.name.size == b.name.size
+    && (a.name.zip b.name).all (fun p => asciiLower p.1 == asciiLower p.2)
 
 /-- The key `handle_dns_request` uses for `cache.get` and `cache.insert`. -/
 def cacheKey (q : Packet) : Option Question := q.questions[0]?
@@ -33,8 +48,12 @@ def cacheKey (q : Packet) : Option Question := q.questions[0]?
 theorem cacheKey_ignores_header (q : Packet) (h : Header) :
     cacheKey { q with header := h } = cacheKey q := rfl
 
-/-- One query through `handle_dns_request` (blocklist omitted: the name
-isn't blocked), with a one-entry cache. `upstream cd` is the response the
+/-- One query through `handle_dns_request`, with a one-entry cache.
+Simplified: the name isn't blocked, the relay to the client always
+succeeds, the upstream's reply always matches the query (F1), and a
+query with no question, which Rust drops silently, is modelled as
+SERVFAIL. A cache hit reports the RCODE and records it replays, before
+TTL aging. `upstream cd` is the response the
 upstream resolver gives for the query's question when the query carries
 that CD bit. Returns the RCODE and answers the client gets, and the new
 cache. -/
@@ -45,7 +64,7 @@ def handle (cache : Option (Question × Entry)) (upstream : Bool → Packet) (q 
   | some k =>
     match cache with
     | some (k', e) =>
-      if k' = k then ((e.response.rcode, e.response.answers), cache)
+      if k'.same k then ((e.response.rcode, e.response.answers), cache)
       else forward k
     | none => forward k
 where
@@ -90,5 +109,28 @@ example :
     let cache := (handle none validatingUpstream (query true)).2
     (handle cache validatingUpstream (query false)).1 = (RCODE_NOERROR, #[aRec 3600]) := by
   decide +kernel
+
+
+/-- Lookups ignore case (C6): `Www.Example.com` finds `www.example.com`. -/
+example : (({ name := #[3, 87, 119, 119, 0], tp := 1, cls := 1 } : Question).same
+    { name := #[3, 119, 119, 119, 0], tp := 1, cls := 1 }) = true := by decide +kernel
+
+/-! ## Opcode -/
+
+def RCODE_NOTIMP : UInt8 := 4
+
+/-- **RFC 1035 §4.1.1**: a server returns NOTIMP ("the name server does not
+support the requested kind of query") for opcodes it doesn't implement.
+rdns implements only QUERY (0). -/
+def OtherOpcodesNotImp : Prop :=
+  ∀ (cache : Option (Question × Entry)) (upstream : Bool → Packet) (q : Packet),
+    q.header.opcode ≠ 0 → ((handle cache upstream q).1).1 = RCODE_NOTIMP
+
+/-- **Counterexample.** An UPDATE (opcode 5) for a cached name gets the cached
+answer, NOERROR. -/
+theorem bug_opcode_ignored : ¬ OtherOpcodesNotImp := fun h => by
+  have := h (handle none validatingUpstream (query true)).2 validatingUpstream
+    { query false with header := { (query false).header with opcode := 5 } } (by decide)
+  revert this; decide +kernel
 
 end Rdns

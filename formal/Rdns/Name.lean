@@ -5,9 +5,12 @@ import Rdns.Wire
 
 `readName` follows the Rust loop statement by statement. Rust's `usize`
 arithmetic is modelled with `Nat`: every addition in `read_name` is of an
-in-bounds index and a value below 2¹⁶, so it cannot overflow, and the one
-subtraction (`pos + 2 - start`, `pos - start`) is shown below never to
-underflow, so Rust never panics where the model truncates.
+in-bounds index and a value below 2¹⁶, so it cannot overflow. The one
+subtraction (`pos + 2 - start`, `pos - start`) is evaluated by Rust only
+while `used` is `None`; `no_underflow` proves `start ≤ pos` in every such
+state, so Rust never panics where the model's `Nat` subtraction would
+truncate. (The model evaluates `used.getD …` eagerly; in `Nat` that gives
+the same result, which is why the underflow needs its own theorem.)
 
 The model is a *total* Lean function: Lean only accepts the definition
 together with a proof that the recursion terminates. That proof is P1 (the
@@ -123,8 +126,7 @@ theorem extract_toList_head (buf : Bytes) (pos k : Nat) (b : UInt8)
 
 
 theorem len_le_63 (b : UInt8) (h : b &&& 0xC0 = 0) : b.toNat ≤ 63 := by
-  have : b ≤ 63 := by bv_decide
-  exact (UInt8.le_iff_toNat_le).mp this
+  exact UInt8.forall_of_lt (P := fun b => b &&& 0xC0 = 0 → b.toNat ≤ 63) (by decide +kernel) b h
 
 /-- **P2 (well-formedness) and absence of underflow.** Loop invariant: the
 name built so far is a sequence of complete labels, and `used` is unset
@@ -185,5 +187,97 @@ theorem readNameLoop_sound (buf : Bytes) (start : Nat) (name : Bytes) (pos : Nat
 theorem readName_wf (buf : Bytes) (start : Nat) (out : Bytes) (u : Nat)
     (h : readName buf start = some (out, u)) : WF out :=
   readNameLoop_sound buf start #[] start none LabelPrefix.nil (fun _ => Nat.le_refl _) out u h
+
+
+/-! ## Bytes consumed -/
+
+/-- `read_name` reports that the name occupies at least one byte at `start`,
+and no more than the buffer holds, so `Reader::name`'s `pos += used`
+stays in bounds. -/
+theorem readNameLoop_consumed (buf : Bytes) (start : Nat) (name : Bytes) (pos : Nat)
+    (used : Option Nat) :
+    (used = none → start ≤ pos) → (∀ v, used = some v → 0 < v ∧ start + v ≤ buf.size) →
+      ∀ out u, readNameLoop buf start name pos used = some (out, u) →
+        0 < u ∧ start + u ≤ buf.size := by
+  induction name, pos, used using readNameLoop.induct buf start with
+  | case1 name pos used hb =>
+    intro _ _ out u h; unfold readNameLoop at h; simp [hb] at h
+  | case2 name pos used b hb hc hlow =>
+    intro _ _ out u h; unfold readNameLoop at h; simp [hb, hc, hlow] at h
+  | case3 name pos used b hb hc low hlow target hge =>
+    intro _ _ out u h; unfold readNameLoop at h; simp only [hb, hc, hlow, ↓reduceIte] at h
+    rw [dif_pos hge] at h; simp at h
+  | case4 name pos used b hb hc low hlow target hlt ih =>
+    intro hn hs out u h
+    unfold readNameLoop at h; simp only [hb, hc, hlow, ↓reduceIte] at h
+    rw [dif_neg hlt] at h
+    have hp1 : pos + 1 < buf.size := by
+      rcases Nat.lt_or_ge (pos + 1) buf.size with h' | h'
+      · exact h'
+      · simp [Array.getElem?_eq_none h'] at hlow
+    refine ih (by simp) (fun v hv => ?_) out u h
+    simp only [Option.some.injEq] at hv
+    subst hv
+    cases used with
+    | none => have := hn rfl; simp; omega
+    | some w => simpa using hs w rfl
+  | case5 name pos used b hb hc hc0 hbig =>
+    intro _ _ out u h; unfold readNameLoop at h; simp [hb, hc, hc0, hbig] at h
+  | case6 name pos used b hb hc hc0 hbig label hl =>
+    intro _ _ out u h; unfold readNameLoop at h
+    simp only [hb, hc, hc0, ↓reduceIte] at h
+    rw [dif_neg hbig, dif_pos hl] at h; simp at h
+  | case7 name pos used hb hc hc0 hbig label hl =>
+    intro hn hs out u h; unfold readNameLoop at h
+    simp only [hb, hc, hc0, ↓reduceIte] at h
+    rw [dif_neg hbig, dif_neg hl] at h
+    simp only [↓reduceDIte, Option.some.injEq, Prod.mk.injEq] at h
+    obtain ⟨-, rfl⟩ := h
+    have hsz : (buf.extract pos (pos + 1 + (0 : UInt8).toNat)).size = 1 := by
+      simp only [Array.size_extract]; simp at hbig ⊢; omega
+    cases used with
+    | none => have := hn rfl; simp only [Option.getD_none, hsz]; simp at hbig; omega
+    | some w => simpa using hs w rfl
+  | case8 name pos used b hb hc hc0 hbig label hl name' pos' hz ih =>
+    intro hn hs out u h; unfold readNameLoop at h
+    simp only [hb, hc, hc0, ↓reduceIte] at h
+    rw [dif_neg hbig, dif_neg hl, dif_neg hz] at h
+    refine ih (fun hu => ?_) hs out u h
+    have := hn hu; simp only [pos']; omega
+  | case9 name pos used b hb hc hc0 =>
+    intro _ _ out u h; unfold readNameLoop at h; simp [hb, hc, hc0] at h
+
+theorem readName_consumed (buf : Bytes) (start : Nat) (out : Bytes) (u : Nat)
+    (h : readName buf start = some (out, u)) : 0 < u ∧ start + u ≤ buf.size :=
+  readNameLoop_consumed buf start #[] start none (fun _ => Nat.le_refl _) (by simp) out u h
+
+/-! ## No underflow
+
+The states of `read_name`'s loop: the initial one, and those its two
+`continue` paths lead to (the `pos = target` and `pos += label.len()`
+branches of `readNameLoop`, with the same guards). -/
+inductive Reach (buf : Bytes) (start : Nat) : Bytes → Nat → Option Nat → Prop
+  | init : Reach buf start #[] start none
+  | pointer {name pos used b low} : Reach buf start name pos used →
+      buf[pos]? = some b → b &&& 0xC0 = 0xC0 → buf[pos + 1]? = some low →
+      ((b.toNat &&& 0x3F) <<< 8) ||| low.toNat < pos →
+      Reach buf start name (((b.toNat &&& 0x3F) <<< 8) ||| low.toNat)
+        (some (used.getD (pos + 2 - start)))
+  | label {name pos used b} : Reach buf start name pos used →
+      buf[pos]? = some b → b &&& 0xC0 = 0 → pos + 1 + b.toNat ≤ buf.size →
+      name.size + (buf.extract pos (pos + 1 + b.toNat)).size ≤ MAX_NAME_LEN → b ≠ 0 →
+      Reach buf start (name ++ buf.extract pos (pos + 1 + b.toNat))
+        (pos + (buf.extract pos (pos + 1 + b.toNat)).size) used
+
+/-- **No underflow.** In every state of the loop where `used` is still
+`None`, which is exactly when Rust evaluates `pos + 2 - start` or
+`pos - start`, `start ≤ pos`. -/
+theorem no_underflow {buf : Bytes} {start : Nat} {name : Bytes} {pos : Nat}
+    (h : Reach buf start name pos none) : start ≤ pos := by
+  generalize hu : (none : Option Nat) = u at h
+  induction h with
+  | init => exact Nat.le_refl _
+  | pointer => simp at hu
+  | label _ _ _ _ _ _ ih => have := ih hu; omega
 
 end Rdns

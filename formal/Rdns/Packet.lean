@@ -46,7 +46,7 @@ structure Packet where
   answers : Array Answer
   authorities : Array Answer
   resources : Array Answer
-  deriving Repr, Inhabited
+  deriving Repr, Inhabited, DecidableEq
 
 /-! ## Reader -/
 
@@ -199,7 +199,13 @@ the bit; `dig` sets it by default, and so does glibc with
 def AD_BIT : UInt8 := 0x20
 
 /-- Byte 3 of the header `response_bytes` writes always carries the query's
-Z, AD and CD bits. Proved for every query. -/
+Z, AD and CD bits, for every query. This states the defect; a fix (clearing
+Z and AD) makes it false, and `bug_ad_bit_forged` turns into a proof of
+`NoForgedAD`. Copying CD is correct (RFC 4035 §3.2.2); copying AD and Z is
+not (RFC 4035 §3.2.3, RFC 1035 §4.1.1: Z "must be zero"). RFC 4035 §4.6
+describes this exact failure: "buggy name servers that blindly copy header
+bits that they do not understand from the query message to the response
+message". -/
 theorem response_copies_z (q : Packet) (rcode : UInt8) (n m : Nat) :
     (responseHeader q rcode n m).z = q.header.z := rfl
 
@@ -247,5 +253,89 @@ theorem r1_response_header (q : Packet) (rcode : UInt8) (n m : Nat) :
     let h := responseHeader q rcode n m
     h.qr = 1 ∧ h.tc = 0 ∧ h.aa = 0 ∧ h.rcode = rcode ∧ h.packetId = q.header.packetId :=
   ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+
+/-! ## EDNS (RFC 6891 §7)
+
+"If an OPT record is present in a received request, compliant responders
+MUST include an OPT record in their respective responses." -/
+
+/-- `response_bytes` never writes an additional section. -/
+theorem response_arcount_zero (q : Packet) (rcode : UInt8) (n m : Nat) :
+    (responseHeader q rcode n m).arcount = 0 := rfl
+
+def Packet.hasOpt (q : Packet) : Bool := q.resources.any (·.tp = TYPE_OPT)
+
+/-- **RFC 6891 §7**, for the responses rdns synthesizes. -/
+def OptEchoed (respond : Packet → Bytes) : Prop :=
+  ∀ q : Packet, q.hasOpt = true → (respond q)[11]! ≠ 0
+
+/-- `dig`'s default query, with its OPT record (UDP size 1232). -/
+def digQueryEdns : Packet :=
+  { digQuery with
+    header := { digQuery.header with arcount := 1 }
+    resources := #[{ name := #[0], tp := TYPE_OPT, cls := 1232, ttl := 0, data := #[] }] }
+
+/-- **Counterexample.** A cache hit, blocked answer or SERVFAIL for an EDNS
+query has ARCOUNT = 0. -/
+theorem bug_opt_missing :
+    ¬ OptEchoed (fun q => q.responseBytes RCODE_NOERROR #[] #[] 0) := fun h =>
+  absurd (h digQueryEdns (by decide +kernel)) (by decide +kernel)
+
+/-! ## Cache hits lose name compression
+
+`response_bytes` writes every name in full, while the upstream's message
+used compression pointers. A cache hit can therefore be much larger than
+the response it was built from, and for a client without EDNS (512 bytes;
+glibc's default) it goes over the limit and `reply` sends TC = 1 with no
+answers instead. rdns has no TCP, so the first lookup works and every
+later one, until the entry expires, fails. -/
+
+def wireName (labels : List (List UInt8)) : Bytes :=
+  (labels.foldl (fun acc l => acc ++ #[UInt8.ofNat l.length] ++ l.toArray) #[]).push 0
+
+def str (s : String) : List UInt8 := s.toList.map (fun c => UInt8.ofNat c.toNat)
+
+/-- `_ldap._tcp.dc._msdcs.corp.example.com`, the SRV name every Active
+Directory client looks up. `corp.example.com` starts at offset 12 + 21. -/
+def adName : Bytes :=
+  wireName [str "_ldap", str "_tcp", str "dc", str "_msdcs", str "corp", str "example", str "com"]
+
+def corpName : Bytes := wireName [str "corp", str "example", str "com"]
+
+/-- Target `dcN.corp.example.com`, compressed as upstreams send it. -/
+def srvTarget (i : Nat) : Bytes := #[3, 100, 99, UInt8.ofNat (48 + i), 0xC0, 33]
+
+def srvRdata (i : Nat) : Bytes := #[0, 0, 0, 100, 1, 133] ++ srvTarget i
+
+/-- An upstream's answer: 10 SRV records, owner names and targets compressed. -/
+def srvRaw : Bytes :=
+  #[0x12, 0x34, 0x81, 0x80, 0, 1, 0, 10, 0, 0, 0, 0] ++ adName ++ #[0, 33, 0, 1]
+    ++ (List.range 10).foldl (fun acc i =>
+        acc ++ #[0xC0, 12, 0, 33, 0, 1, 0, 0, 14, 16, 0, (srvRdata i).size.toUInt8]
+          ++ srvRdata i) #[]
+
+/-- The same records as `from_bytes` decodes them: every name in full. -/
+def srvParsed : Packet :=
+  { header := Header.ofBytes 0x12 0x34 0x81 0x80 0 1 0 10 0 0 0 0
+    questions := #[{ name := adName, tp := 33, cls := 1 }]
+    answers := (List.range 10).toArray.map (fun i =>
+      { name := adName, tp := 33, cls := 1, ttl := 3600,
+        data := #[0, 0, 0, 100, 1, 133, 3, 100, 99, UInt8.ofNat (48 + i)] ++ corpName })
+    authorities := #[], resources := #[] }
+
+/-! The link between the two is checked by running the model (the same
+code the differential test compares with rdns), not by the kernel: the
+kernel can't evaluate `readName`, which is defined by well-founded
+recursion. -/
+#guard Packet.fromBytes srvRaw == some srvParsed
+
+/-- **Counterexample (compression).** The upstream's response is 295 bytes
+and fits a 512-byte client; the cache hit rebuilt from the same records is
+825 bytes, so that client gets TC = 1 and no answers. -/
+theorem bug_cache_hit_loses_compression :
+    srvRaw.size = 295 ∧
+    (srvParsed.responseBytes RCODE_NOERROR srvParsed.answers #[] 1).size = 825 := by
+  decide +kernel
 
 end Rdns

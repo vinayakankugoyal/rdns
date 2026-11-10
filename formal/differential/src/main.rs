@@ -3,7 +3,8 @@
 //!
 //! ```bash
 //! cd formal && lake build rdns-model
-//! cd differential && cargo run --release -- 100000
+//! cd differential && cargo run --release -- 200000
+//! cargo run -- 200000            # debug build: Rust overflow checks on
 //! ```
 //!
 //! Prints the first disagreements, if any, and exits non-zero on any.

@@ -1,5 +1,4 @@
 import Rdns.Packet
-import Std.Tactic.BVDecide
 
 /-!
 # Cache (`src/cache.rs`)
@@ -113,10 +112,14 @@ theorem servedTtl_eq (a : Answer) (t : Nat) (h : ageAt t < 2 ^ 32) :
 
 /-! ## Properties that hold -/
 
-/-- **Records never outlive their TTL downstream.** Whatever `min_ttl` is,
-a record served at `t` with TTL `s` is dropped by a downstream cache at
-`t + s` seconds, which is no later than the record's own expiry (or `t`
-itself, if the record has already expired and is served with TTL 0). -/
+/-- **Records never outlive their TTL downstream** (the TTL arithmetic).
+If rdns serves record `a` at time `t` with the TTL `response_bytes`
+writes for age `ageAt t` (which is what `handle_dns_request` passes, as
+`hit.age`), a downstream cache drops it at `t + s` seconds, no later than
+the record's own expiry (or `t` itself, if the record has already expired
+and is served with TTL 0). This is a statement about `satSub` and the
+rounding in `ageAt`, independent of `min_ttl`; that `main.rs` passes
+`hit.age` is not modelled. -/
 theorem served_record_never_outlives_ttl (a : Answer) (t : Nat) (h : ageAt t < 2 ^ 32) :
     t + servedTtl a t * NS ≤ max t (a.ttl.toNat * NS) := by
   rw [servedTtl_eq a t h]
@@ -126,10 +129,22 @@ theorem served_record_never_outlives_ttl (a : Answer) (t : Nat) (h : ageAt t < 2
   · have : (a.ttl.toNat - ageAt t) * NS = a.ttl.toNat * NS - ageAt t * NS := Nat.sub_mul _ _ _
     omega
 
-theorem u32_min_le_left (a b : UInt32) : min a b ≤ a := by rw [UInt32.min_def]; bv_decide
-theorem u32_min_le_right (a b : UInt32) : min a b ≤ b := by rw [UInt32.min_def]; bv_decide
-theorem u32_le_trans {a b c : UInt32} (h1 : a ≤ b) (h2 : b ≤ c) : a ≤ c := by bv_decide
-theorem u32_max_zero (a : UInt32) : max a 0 = a := by rw [UInt32.max_def]; bv_decide
+theorem u32_min_le_left (a b : UInt32) : min a b ≤ a := by
+  rw [UInt32.min_def]; split
+  · exact UInt32.le_iff_toNat_le.mpr (Nat.le_refl _)
+  · next h => rw [UInt32.le_iff_toNat_le] at h ⊢; omega
+theorem u32_min_le_right (a b : UInt32) : min a b ≤ b := by
+  rw [UInt32.min_def]; split
+  · assumption
+  · exact UInt32.le_iff_toNat_le.mpr (Nat.le_refl _)
+theorem u32_le_trans {a b c : UInt32} (h1 : a ≤ b) (h2 : b ≤ c) : a ≤ c := by
+  rw [UInt32.le_iff_toNat_le] at *; omega
+theorem u32_max_zero (a : UInt32) : max a 0 = a := by
+  rw [UInt32.max_def]; split
+  · next h =>
+    rw [UInt32.le_iff_toNat_le] at h
+    exact UInt32.toNat_inj.mp (by simp at h ⊢; omega)
+  · rfl
 
 theorem minTtl?_le (as : Array Answer) (m : UInt32) (h : minTtl? as = some m) :
     ∀ a ∈ as, m ≤ a.ttl := by
@@ -372,5 +387,30 @@ harmless, because the CNAME really may be cached for 3600 s
 (`served_record_never_outlives_ttl`); it is the spec that overclaims. -/
 theorem c3_as_stated_is_false : ¬ C3 := fun h =>
   absurd (h 0 (resp RCODE_NOERROR #[aRec 60, cname 3600] #[]) 0) (by decide +kernel)
+
+
+/-! ### DNSSEC records in negative answers -/
+
+def nsec : Answer := { name := nm, tp := 47, cls := 1, ttl := 300, data := #[0, 0, 6, 0, 0, 0, 3] }
+def rrsig : Answer := { name := nm, tp := 46, cls := 1, ttl := 300, data := #[0, 6, 13, 2] }
+
+/-- **RFC 2308 §5**: "The NXT record, if it exists in the authority section
+of a negative answer received, MUST be stored such that it can be be
+located and returned with SOA record in the authority section, as should
+any SIG records in the authority section." (NSEC and RRSIG today.) -/
+def keepsProofsAt (r : Packet) : Bool :=
+  match insertEntry 0 r with
+  | some e => e.response.authorities.size == r.authorities.size
+  | none => true
+
+def NegativeEntriesKeepProofs : Prop :=
+  ∀ r : Packet, r.answers.isEmpty = true → keepsProofsAt r = true
+
+/-- **Counterexample.** `insert_at` keeps only the SOA, so a signed NXDOMAIN
+(SOA, NSEC, RRSIG) is replayed without its proof of non-existence, and a
+validating stub behind rdns can't validate the cached answer. -/
+theorem bug_negative_entries_drop_nsec : ¬ NegativeEntriesKeepProofs := fun h =>
+  absurd (h (resp RCODE_NXDOMAIN #[] #[soa 3600 300, nsec, rrsig]) (by decide +kernel))
+    (by decide +kernel)
 
 end Rdns
