@@ -2,14 +2,12 @@
 
 use crate::blocklist::DNSBlocklist;
 use crate::cache::DNSCache;
-use crate::packet::DNSPacket;
+use crate::packet::{DNSPacket, MAX_UDP_PAYLOAD, Question, RCODE_NOERROR, RCODE_SERVFAIL, set_id};
 use chrono::Local;
 use clap::Parser;
-use std::collections::HashMap;
 use std::io;
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::{Arc, Mutex};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
@@ -21,14 +19,23 @@ mod metrics;
 mod packet;
 mod tui;
 
-/// Maximum size of a UDP DNS message (RFC 1035).
-const MAX_PACKET_SIZE: usize = 512;
+#[cfg(test)]
+#[path = "spec/forwarder_spec.rs"]
+mod forwarder_spec;
 
 /// Port the Prometheus metrics endpoint listens on.
 const METRICS_PORT: u16 = 3030;
 
 /// Capacity of the broadcast channel used for log lines.
 const LOG_CHANNEL_CAPACITY: usize = 100;
+
+/// Receive buffer for upstream responses: the largest possible UDP
+/// payload, so no response is ever cut short, whatever EDNS size the
+/// client asked the upstream for.
+const MAX_UPSTREAM_PAYLOAD: usize = 65535;
+
+/// How long to wait for the upstream resolver before answering SERVFAIL.
+const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Interval between cache cleanup sweeps.
 const CACHE_CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
@@ -44,35 +51,26 @@ struct Args {
     #[arg(short, long, default_value_t = 53)]
     port: u16,
 
+    /// Keep cache entries for at least this many seconds, even when record
+    /// TTLs are shorter. Served TTLs still count down to 0.
+    #[arg(long, default_value_t = 0)]
+    min_cache_ttl: u32,
+
     /// Disable the TUI and run in headless mode
     #[arg(long, default_value_t = false)]
     no_tui: bool,
-}
-
-/// A query forwarded upstream, awaiting its response.
-struct PendingQuery {
-    /// Client to relay the response back to.
-    client: SocketAddr,
-    /// Transaction ID from the client's original query.
-    original_id: u16,
-    /// When the query was forwarded, for latency measurement.
-    sent_at: Instant,
 }
 
 /// Shared state for the forwarder, cloned across tasks behind one `Arc`.
 struct Server {
     /// Socket clients talk to us on.
     client_socket: UdpSocket,
-    /// Socket we talk to the upstream resolver on.
-    resolver_socket: UdpSocket,
     resolver_addr: SocketAddr,
+    /// How long to wait for the upstream before answering SERVFAIL.
+    upstream_timeout: Duration,
     cache: DNSCache,
     /// Kept behind its own `Arc` so the TUI can hold a reference too.
     blocklist: Arc<DNSBlocklist>,
-    /// Forwarded queries keyed by the transaction ID we assigned them.
-    pending: Mutex<HashMap<u16, PendingQuery>>,
-    /// Source of transaction IDs for forwarded queries.
-    next_id: AtomicU16,
     log_tx: broadcast::Sender<String>,
 }
 
@@ -84,6 +82,69 @@ impl Server {
         let _ = self
             .log_tx
             .send(format!("[{}] {}", timestamp, message.as_ref()));
+    }
+
+    /// Forwards the raw `query` upstream and waits for the response that
+    /// answers `question`. Returns the raw response and its parsed form.
+    ///
+    /// Each query gets its own socket on a kernel-chosen ephemeral port,
+    /// connected to the resolver (so datagrams from any other address are
+    /// discarded by the kernel), and a random transaction ID. A datagram is
+    /// accepted only if it is a well-formed response with that ID to the
+    /// same question; anything else is ignored until the timeout.
+    async fn forward(
+        &self,
+        mut query: Vec<u8>,
+        question: &Question,
+    ) -> io::Result<(Vec<u8>, DNSPacket)> {
+        let local: SocketAddr = if self.resolver_addr.is_ipv4() {
+            (Ipv4Addr::UNSPECIFIED, 0).into()
+        } else {
+            (Ipv6Addr::UNSPECIFIED, 0).into()
+        };
+        let socket = UdpSocket::bind(local).await?;
+        socket.connect(self.resolver_addr).await?;
+
+        let id: u16 = rand::random();
+        set_id(&mut query, id);
+        socket.send(&query).await?;
+
+        let mut buf = vec![0; MAX_UPSTREAM_PAYLOAD];
+        let wait_for_answer = async {
+            loop {
+                let size = socket.recv(&mut buf).await?;
+                let Some(response) = DNSPacket::from_bytes(&buf[..size]) else {
+                    continue;
+                };
+                if response.header.packet_id == id
+                    && response.header.qr == 1
+                    && response.questions.first() == Some(question)
+                {
+                    return Ok((buf[..size].to_vec(), response));
+                }
+            }
+        };
+        tokio::time::timeout(self.upstream_timeout, wait_for_answer)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "upstream timed out"))?
+    }
+
+    /// Sends `response` to the client that sent `query`. If it is larger
+    /// than the client can receive, sends an empty response with TC set
+    /// instead.
+    async fn reply(
+        &self,
+        query: &DNSPacket,
+        response: Vec<u8>,
+        client: SocketAddr,
+    ) -> io::Result<()> {
+        let response = if response.len() > query.udp_payload_limit() {
+            query.truncated_bytes(response[3] & 0x0f)
+        } else {
+            response
+        };
+        self.client_socket.send_to(&response, client).await?;
+        Ok(())
     }
 }
 
@@ -103,78 +164,17 @@ async fn run_metrics_server() {
         .await;
 }
 
-/// Relays upstream resolver responses back to the clients that asked for
-/// them, recording latency and populating the cache.
-async fn process_resolver_responses(server: Arc<Server>) {
-    let mut buf = [0; MAX_PACKET_SIZE];
-
-    loop {
-        let (size, source) = match server.resolver_socket.recv_from(&mut buf).await {
-            Ok(received) => received,
-            Err(e) => {
-                server.log(format!("Failed to receive from resolver: {}", e));
-                continue;
-            }
-        };
-        if source != server.resolver_addr {
-            continue;
-        }
-
-        let Some(mut packet) = DNSPacket::from_bytes(&buf[..size]) else {
-            continue;
-        };
-
-        let pending_entry = server
-            .pending
-            .lock()
-            .unwrap()
-            .remove(&packet.header.packet_id);
-
-        let Some(query) = pending_entry else {
-            server.log("Transaction ID not found!");
-            continue;
-        };
-
-        let latency = query.sent_at.elapsed();
-        metrics::RESPONSE_TIME.observe(latency.as_secs_f64());
-        metrics::record_latency(latency.as_millis() as u64);
-
-        packet.header.packet_id = query.original_id;
-        if let Err(e) = server
-            .client_socket
-            .send_to(&packet.to_bytes(), query.client)
-            .await
-        {
-            server.log(format!("Failed to relay response: {}", e));
-            continue;
-        }
-
-        if let Some(question) = packet.questions.first() {
-            server.log(format!(
-                "[{}] {} -> FORWARDED ({}ms)",
-                query.client,
-                question.display_name(),
-                latency.as_millis()
-            ));
-        }
-
-        // The packet is no longer needed, so its parts can move into the
-        // cache without cloning.
-        if !packet.questions.is_empty() {
-            let question = packet.questions.swap_remove(0);
-            server.cache.insert(question, packet.answers);
-        }
-    }
-}
-
 /// Handles a single client query: answers from the blocklist or cache when
-/// possible, otherwise forwards it upstream.
+/// possible, otherwise forwards it upstream and relays the response.
 async fn handle_dns_request(server: Arc<Server>, data: Vec<u8>, source: SocketAddr) {
     let start = Instant::now();
-    let Some(mut packet) = DNSPacket::from_bytes(&data) else {
+    let Some(packet) = DNSPacket::from_bytes(&data) else {
         return;
     };
-
+    // Only queries are answered; stray responses are dropped.
+    if packet.header.qr == 1 {
+        return;
+    }
     let Some(question) = packet.questions.first() else {
         return;
     };
@@ -190,28 +190,26 @@ async fn handle_dns_request(server: Arc<Server>, data: Vec<u8>, source: SocketAd
 
     if server.blocklist.contains(&q_name) {
         metrics::BLOCKED_REQUESTS.inc();
-        let latency = start.elapsed();
-        metrics::RESPONSE_TIME.observe(latency.as_secs_f64());
-        metrics::record_latency(latency.as_millis() as u64);
+        record_latency(start);
 
-        let answers = [question.to_blocked_answer()];
-        let response = packet.response_bytes(&answers);
-        match server.client_socket.send_to(&response, source).await {
-            Ok(_) => server.log(format!("[{}] {} -> BLOCKED", source, q_name)),
+        let answers: Vec<_> = question.to_blocked_answer().into_iter().collect();
+        let response = packet.response_bytes(RCODE_NOERROR, &answers, &[], 0);
+        match server.reply(&packet, response, source).await {
+            Ok(()) => server.log(format!("[{}] {} -> BLOCKED", source, q_name)),
             Err(e) => server.log(format!("Failed to send blocked response: {}", e)),
         }
         return;
     }
 
-    if let Some(answers) = server.cache.get(question) {
+    if let Some(hit) = server.cache.get(question) {
         metrics::CACHE_HITS.inc();
-        let latency = start.elapsed();
-        metrics::RESPONSE_TIME.observe(latency.as_secs_f64());
-        metrics::record_latency(latency.as_millis() as u64);
+        let latency = record_latency(start);
 
-        let response = packet.response_bytes(&answers);
-        match server.client_socket.send_to(&response, source).await {
-            Ok(_) => server.log(format!(
+        let cached = &hit.response;
+        let response =
+            packet.response_bytes(cached.rcode, &cached.answers, &cached.authorities, hit.age);
+        match server.reply(&packet, response, source).await {
+            Ok(()) => server.log(format!(
                 "[{}] {} -> CACHE HIT ({}µs)",
                 source,
                 q_name,
@@ -224,27 +222,40 @@ async fn handle_dns_request(server: Arc<Server>, data: Vec<u8>, source: SocketAd
 
     metrics::CACHE_MISSES.inc();
 
-    let original_id = packet.header.packet_id;
-    let new_id = server.next_id.fetch_add(1, Ordering::Relaxed);
+    let (mut raw, upstream) = match server.forward(data, question).await {
+        Ok(response) => response,
+        Err(e) => {
+            server.log(format!("[{}] {} -> SERVFAIL ({})", source, q_name, e));
+            let response = packet.response_bytes(RCODE_SERVFAIL, &[], &[], 0);
+            let _ = server.reply(&packet, response, source).await;
+            return;
+        }
+    };
+    let latency = record_latency(start);
 
-    server.pending.lock().unwrap().insert(
-        new_id,
-        PendingQuery {
-            client: source,
-            original_id,
-            sent_at: Instant::now(),
-        },
-    );
-
-    packet.header.packet_id = new_id;
-    if let Err(e) = server
-        .resolver_socket
-        .send_to(&packet.to_bytes(), server.resolver_addr)
-        .await
-    {
-        server.log(format!("Failed to forward request: {}", e));
-        server.pending.lock().unwrap().remove(&new_id);
+    // Relay the upstream bytes untouched apart from the ID, so nothing is
+    // lost or reshaped in re-serialization.
+    set_id(&mut raw, packet.header.packet_id);
+    if let Err(e) = server.reply(&packet, raw, source).await {
+        server.log(format!("Failed to relay response: {}", e));
+        return;
     }
+    server.log(format!(
+        "[{}] {} -> FORWARDED ({}ms)",
+        source,
+        q_name,
+        latency.as_millis()
+    ));
+
+    server.cache.insert(question.clone(), upstream);
+}
+
+/// Records the time since `start` in the latency metrics and returns it.
+fn record_latency(start: Instant) -> Duration {
+    let latency = start.elapsed();
+    metrics::RESPONSE_TIME.observe(latency.as_secs_f64());
+    metrics::record_latency(latency.as_millis() as u64);
+    latency
 }
 
 /// Periodically evicts expired cache entries.
@@ -263,12 +274,10 @@ async fn main() -> io::Result<()> {
 
     let server = Arc::new(Server {
         client_socket: UdpSocket::bind(("0.0.0.0", args.port)).await?,
-        resolver_socket: UdpSocket::bind("0.0.0.0:0").await?,
         resolver_addr: args.resolver,
-        cache: DNSCache::new(),
+        upstream_timeout: UPSTREAM_TIMEOUT,
+        cache: DNSCache::new(args.min_cache_ttl),
         blocklist: Arc::new(DNSBlocklist::new()),
-        pending: Mutex::new(HashMap::new()),
-        next_id: AtomicU16::new(0),
         log_tx: log_tx.clone(),
     });
 
@@ -285,7 +294,6 @@ async fn main() -> io::Result<()> {
         }
     });
 
-    tokio::spawn(process_resolver_responses(Arc::clone(&server)));
     tokio::spawn(cleanup_cache(Arc::clone(&server)));
 
     if !args.no_tui {
@@ -300,7 +308,7 @@ async fn main() -> io::Result<()> {
         });
     }
 
-    let mut buf = [0; MAX_PACKET_SIZE];
+    let mut buf = [0; MAX_UDP_PAYLOAD];
     loop {
         let (size, source) = server.client_socket.recv_from(&mut buf).await?;
         if source == server.resolver_addr {

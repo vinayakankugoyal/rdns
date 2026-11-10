@@ -1,4 +1,17 @@
 //! TTL-based cache for DNS responses.
+//!
+//! What is cached, and for how long, follows RFC 1035 §3.2.1 and RFC 2308:
+//!
+//! * a NOERROR response with answers lives for its smallest record TTL;
+//! * a negative response (NXDOMAIN, or NOERROR with no answers) lives for
+//!   `min(SOA TTL, SOA MINIMUM)` and is not cached without an SOA;
+//! * truncated responses, error responses (SERVFAIL, REFUSED, …) and
+//!   anything with a TTL of 0 are not cached.
+//!
+//! An operator-chosen minimum lifetime (`--min-cache-ttl`) can extend how
+//! long entries are kept, but records are always served with their
+//! *remaining* TTL, saturating at 0, so downstream caches never hold them
+//! longer than the authority allowed.
 
 use std::{
     collections::HashMap,
@@ -6,58 +19,117 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::packet::{Answer, Question};
+use crate::packet::{Answer, DNSPacket, Question, RCODE_NOERROR, RCODE_NXDOMAIN};
 
-/// Minimum time (seconds) an entry stays cached, regardless of record TTLs.
-const MIN_CACHE_TTL: u32 = 300;
-
-/// TTL assumed for responses that carry no answers.
-const DEFAULT_CACHE_TTL: u32 = 300;
+/// The parts of an upstream response the cache replays.
+#[derive(Debug)]
+pub struct CachedResponse {
+    pub rcode: u8,
+    pub answers: Vec<Answer>,
+    /// For negative responses, the SOA that bounds the negative TTL.
+    pub authorities: Vec<Answer>,
+}
 
 struct CacheEntry {
-    answers: Arc<[Answer]>,
+    response: Arc<CachedResponse>,
+    inserted: Instant,
     expiration: Instant,
+}
+
+/// A cache lookup result: the response plus how long it has been cached,
+/// which callers subtract from every TTL they serve.
+pub struct CacheHit {
+    pub response: Arc<CachedResponse>,
+    /// Seconds since insertion, rounded up.
+    pub age: u32,
 }
 
 /// A thread-safe DNS response cache keyed by question.
 ///
-/// Answers are stored behind an `Arc` so lookups hand out a cheap reference
-/// instead of cloning every record.
+/// Responses are stored behind an `Arc` so lookups hand out a cheap
+/// reference instead of cloning every record.
 pub struct DNSCache {
     store: RwLock<HashMap<Question, CacheEntry>>,
+    /// Minimum time (seconds) an entry is kept, regardless of record TTLs.
+    min_ttl: u32,
+}
+
+/// How long `response` may be cached, or `None` if it must not be.
+pub fn cache_ttl(response: &DNSPacket) -> Option<u32> {
+    if response.header.tc == 1 {
+        return None;
+    }
+    let ttl = match response.header.rcode {
+        RCODE_NOERROR if !response.answers.is_empty() => {
+            response.answers.iter().map(|a| a.ttl).min()?
+        }
+        RCODE_NOERROR | RCODE_NXDOMAIN => {
+            let soa = response
+                .authorities
+                .iter()
+                .find_map(|a| Some((a.ttl, a.soa_minimum()?)))?;
+            soa.0.min(soa.1)
+        }
+        _ => return None,
+    };
+    (ttl > 0).then_some(ttl)
 }
 
 impl DNSCache {
-    pub fn new() -> Self {
+    pub fn new(min_ttl: u32) -> Self {
         Self {
             store: RwLock::new(HashMap::new()),
+            min_ttl,
         }
     }
 
-    /// Returns the cached answers for `q`, if present and not expired.
-    pub fn get(&self, q: &Question) -> Option<Arc<[Answer]>> {
-        let cache = self.store.read().unwrap();
-        cache
-            .get(q)
-            .filter(|entry| entry.expiration > Instant::now())
-            .map(|entry| Arc::clone(&entry.answers))
+    /// Returns the cached response for `q`, if present and not expired.
+    pub fn get(&self, q: &Question) -> Option<CacheHit> {
+        self.get_at(q, Instant::now())
     }
 
-    /// Caches `answers` for `q`, expiring after the smallest record TTL
-    /// (clamped to at least [`MIN_CACHE_TTL`]).
-    pub fn insert(&self, q: Question, answers: Vec<Answer>) {
-        let min_ttl = answers
-            .iter()
-            .map(|a| a.ttl)
-            .min()
-            .unwrap_or(DEFAULT_CACHE_TTL);
-        let effective_ttl = min_ttl.max(MIN_CACHE_TTL);
+    fn get_at(&self, q: &Question, now: Instant) -> Option<CacheHit> {
+        let cache = self.store.read().unwrap();
+        let entry = cache.get(q).filter(|entry| entry.expiration > now)?;
+        let age = now.saturating_duration_since(entry.inserted);
+        let age = age.as_secs() + u64::from(age.subsec_nanos() > 0);
+        Some(CacheHit {
+            response: Arc::clone(&entry.response),
+            age: u32::try_from(age).unwrap_or(u32::MAX),
+        })
+    }
 
+    /// Caches `response` under `q` if [`cache_ttl`] allows it. Returns
+    /// whether it was cached.
+    pub fn insert(&self, q: Question, response: DNSPacket) -> bool {
+        self.insert_at(q, response, Instant::now())
+    }
+
+    fn insert_at(&self, q: Question, response: DNSPacket, now: Instant) -> bool {
+        let Some(ttl) = cache_ttl(&response) else {
+            return false;
+        };
+        let negative = response.answers.is_empty();
+        let authorities = if negative {
+            response
+                .authorities
+                .into_iter()
+                .filter(|a| a.soa_minimum().is_some())
+                .collect()
+        } else {
+            Vec::new()
+        };
         let entry = CacheEntry {
-            answers: answers.into(),
-            expiration: Instant::now() + Duration::from_secs(effective_ttl.into()),
+            response: Arc::new(CachedResponse {
+                rcode: response.header.rcode,
+                answers: response.answers,
+                authorities,
+            }),
+            inserted: now,
+            expiration: now + Duration::from_secs(ttl.max(self.min_ttl).into()),
         };
         self.store.write().unwrap().insert(q, entry);
+        true
     }
 
     /// Drops every entry that has expired as of `now`.
@@ -68,3 +140,7 @@ impl DNSCache {
             .retain(|_, entry| entry.expiration > now);
     }
 }
+
+#[cfg(test)]
+#[path = "spec/cache_spec.rs"]
+mod spec;
