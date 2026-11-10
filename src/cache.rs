@@ -6,7 +6,9 @@
 //! * a negative response (NXDOMAIN, or NOERROR with no answers) lives for
 //!   `min(SOA TTL, SOA MINIMUM)` and is not cached without an SOA;
 //! * truncated responses, error responses (SERVFAIL, REFUSED, …) and
-//!   anything with a TTL of 0 are not cached.
+//!   anything with a TTL of 0 are not cached;
+//! * a TTL with the top bit set counts as 0 (RFC 2181 §8), so no entry
+//!   lives longer than 2³¹ − 1 seconds.
 //!
 //! An operator-chosen minimum lifetime (`--min-cache-ttl`) can extend how
 //! long entries are kept, but records are always served with their
@@ -61,18 +63,25 @@ pub fn cache_ttl(response: &DNSPacket) -> Option<u32> {
     }
     let ttl = match response.header.rcode {
         RCODE_NOERROR if !response.answers.is_empty() => {
-            response.answers.iter().map(|a| a.ttl).min()?
+            response.answers.iter().map(|a| received_ttl(a.ttl)).min()?
         }
         RCODE_NOERROR | RCODE_NXDOMAIN => {
             let soa = response
                 .authorities
                 .iter()
                 .find_map(|a| Some((a.ttl, a.soa_minimum()?)))?;
-            soa.0.min(soa.1)
+            received_ttl(soa.0).min(received_ttl(soa.1))
         }
         _ => return None,
     };
     (ttl > 0).then_some(ttl)
+}
+
+/// A TTL as received: values with the top bit set count as 0 (RFC 2181
+/// §8: "Implementations should treat TTL values received with the most
+/// significant bit set as if the entire value received was zero").
+fn received_ttl(ttl: u32) -> u32 {
+    if ttl >= 0x8000_0000 { 0 } else { ttl }
 }
 
 impl DNSCache {

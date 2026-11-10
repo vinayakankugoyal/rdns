@@ -33,16 +33,22 @@ def Answer.soaMinimum (a : Answer) : Option UInt32 :=
 def minTtl? (as : Array Answer) : Option UInt32 :=
   as.foldl (fun acc a => some (match acc with | none => a.ttl | some m => min m a.ttl)) none
 
+/-- `received_ttl`: a TTL with the top bit set counts as 0 (RFC 2181 §8). -/
+def receivedTtl (t : UInt32) : UInt32 := if t ≥ 0x80000000 then 0 else t
+
+/-- A record with its TTL as received. -/
+def Answer.received (a : Answer) : Answer := { a with ttl := receivedTtl a.ttl }
+
 /-- `cache_ttl`. -/
 def cacheTtl (r : Packet) : Option UInt32 :=
   if r.header.tc = 1 then none
   else
     let ttl? : Option UInt32 :=
       if r.header.rcode = RCODE_NOERROR ∧ ¬ r.answers.isEmpty then
-        minTtl? r.answers
+        minTtl? (r.answers.map Answer.received)
       else if r.header.rcode = RCODE_NOERROR ∨ r.header.rcode = RCODE_NXDOMAIN then
         (r.authorities.findSome? (fun a => a.soaMinimum.map (fun m => (a.ttl, m)))).map
-          (fun p => min p.1 p.2)
+          (fun p => min (receivedTtl p.1) (receivedTtl p.2))
       else none
     match ttl? with
     | some t => if t > 0 then some t else none
@@ -182,6 +188,18 @@ theorem minTtl?_le (as : Array Answer) (m : UInt32) (h : minTtl? as = some m) :
         | inl e => subst e; exact u32_le_trans hmin hx
         | inr e => exact h2 a e
 
+theorem receivedTtl_le (t : UInt32) : receivedTtl t ≤ t := by
+  unfold receivedTtl; split
+  · exact UInt32.le_iff_toNat_le.mpr (by simp)
+  · exact UInt32.le_iff_toNat_le.mpr (Nat.le_refl _)
+
+theorem receivedTtl_lt (t : UInt32) : receivedTtl t < 0x80000000 := by
+  unfold receivedTtl; split
+  · decide
+  · next h =>
+    have h' : ¬ (0x80000000 : UInt32).toNat ≤ t.toNat := fun h' => h (UInt32.le_iff_toNat_le.mpr h')
+    rw [UInt32.lt_iff_toNat_lt]; simp at h' ⊢; omega
+
 /-- **No stale positive answers.** Without `--min-cache-ttl`, a NOERROR
 response with answers is never served after any of its records has
 expired: the entry lives exactly as long as its shortest TTL. -/
@@ -206,8 +224,9 @@ theorem positive_entries_never_stale (r : Packet) (e : Entry) (t : Nat)
         split at hc
         next =>
           simp only [Option.some.injEq] at hc; subst hc
-          have := minTtl?_le r.answers m hm a ha
-          have hle : m.toNat ≤ a.ttl.toNat := UInt32.le_iff_toNat_le.mp this
+          have := minTtl?_le _ m hm a.received (Array.mem_map_of_mem ha)
+          have hle : m.toNat ≤ a.ttl.toNat :=
+            UInt32.le_iff_toNat_le.mp (u32_le_trans this (receivedTtl_le a.ttl))
           simp only [Entry.live] at hlive
           have : (max m 0).toNat = m.toNat := by rw [u32_max_zero]
           rw [this] at hlive
@@ -351,21 +370,72 @@ NXDOMAIN-with-answers response that the spec's `cache_ttl` refuses. -/
 theorem bug_c4_spec_mismatch : ¬ ∀ r, cacheTtl r = specCacheTtl r := fun h =>
   absurd (h (resp RCODE_NXDOMAIN #[cname 30] #[soa 3600 3600])) (by decide +kernel)
 
-/-! ### TTLs with the top bit set -/
+/-! ### TTLs with the top bit set
 
-/-- **RFC 2181 §8**: "Implementations should treat TTL values received with
-the most significant bit set as if the entire value received was zero."
-So such a response must not be cached. -/
-def HighBitTtlsNotCached : Prop :=
-  ∀ r : Packet, r.answers.any (·.ttl ≥ 0x80000000) = true → cacheTtl r = none
+RFC 2181 §8: "Implementations should treat TTL values received with the
+most significant bit set as if the entire value received was zero." Until
+#21 a record with TTL `0xFFFFFFFF` was cached for 2³² − 1 seconds. -/
 
-/-- **Counterexample.** A record with TTL `0xFFFFFFFF` is cached for
-2³² − 1 seconds (136 years) and served with that TTL. -/
-theorem bug_high_bit_ttl_cached : ¬ HighBitTtlsNotCached := fun h =>
-  absurd (h (resp RCODE_NOERROR #[aRec 0xFFFFFFFF] #[]) (by decide +kernel)) (by decide +kernel)
+theorem minTtl?_lt (as : Array Answer) (m B : UInt32) (h : minTtl? as = some m)
+    (hb : ∀ a ∈ as, a.ttl < B) : m < B := by
+  by_cases hs : as.size = 0
+  · have : as = #[] := Array.eq_empty_of_size_eq_zero hs
+    subst this; simp [minTtl?] at h
+  · have hmem : as[0]'(by omega) ∈ as := Array.getElem_mem (by omega)
+    have h1 := minTtl?_le as m h _ hmem
+    have h2 := hb _ hmem
+    rw [UInt32.le_iff_toNat_le] at h1; rw [UInt32.lt_iff_toNat_lt] at h2 ⊢; omega
 
-example : (insertEntry 0 (resp RCODE_NOERROR #[aRec 0xFFFFFFFF] #[])).map (·.lifetime)
-    = some 4294967295 := by decide +kernel
+/-- **No entry outlives 2³¹ − 1 seconds** (without `--min-cache-ttl`):
+`cache_ttl` never returns a TTL with the top bit set. -/
+theorem cacheTtl_lt (r : Packet) (t : UInt32) (h : cacheTtl r = some t) : t < 0x80000000 := by
+  unfold cacheTtl at h
+  split at h
+  · simp at h
+  · have key : ∀ ttl? : Option UInt32, (match ttl? with
+        | some t => if t > 0 then some t else none | none => none) = some t → ttl? = some t := by
+      intro o ho; cases o with
+      | none => simp at ho
+      | some x => simp only at ho; split at ho <;> simp_all
+    have h := key _ h
+    split at h
+    · exact minTtl?_lt _ t _ h (fun a ha => by
+        obtain ⟨b, -, rfl⟩ := Array.mem_map.mp ha
+        exact receivedTtl_lt b.ttl)
+    · split at h
+      · cases hf : r.authorities.findSome? (fun a => a.soaMinimum.map (fun m => (a.ttl, m))) with
+        | none => simp [hf] at h
+        | some p =>
+          simp only [hf, Option.map_some, Option.some.injEq] at h
+          subst h
+          have := receivedTtl_lt p.1
+          have := u32_min_le_left (receivedTtl p.1) (receivedTtl p.2)
+          rw [UInt32.le_iff_toNat_le] at *; rw [UInt32.lt_iff_toNat_lt] at *; omega
+      · simp at h
+
+/-- **RFC 2181 §8 for positive answers**: a NOERROR response with any
+answer TTL ≥ 2³¹ isn't cached. (For NXDOMAIN with answers, a negative
+answer behind a CNAME, the answers' TTLs bound the lifetime only once #18
+is fixed.) -/
+theorem high_bit_ttls_not_cached (r : Packet) (hpos : r.header.rcode = RCODE_NOERROR)
+    (a : Answer) (ha : a ∈ r.answers) (hhi : a.ttl ≥ 0x80000000) : cacheTtl r = none := by
+  have hne : ¬ r.answers.isEmpty := by
+    intro he; simp [Array.isEmpty_iff] at he; rw [he] at ha; simp at ha
+  unfold cacheTtl
+  split
+  · rfl
+  · simp only [hpos, hne, not_false_eq_true, and_self, ↓reduceIte]
+    cases hm : minTtl? (r.answers.map Answer.received) with
+    | none => rfl
+    | some m =>
+      have := minTtl?_le _ m hm a.received (Array.mem_map_of_mem ha)
+      have h0 : a.received.ttl = 0 := by simp [Answer.received, receivedTtl, hhi]
+      rw [h0, UInt32.le_iff_toNat_le] at this
+      have : m = 0 := UInt32.toNat_inj.mp (by simp at this ⊢; omega)
+      simp [this]
+
+/-- The former counterexample: TTL `0xFFFFFFFF` is no longer cached. -/
+example : insertEntry 0 (resp RCODE_NOERROR #[aRec 0xFFFFFFFF] #[]) |>.isNone := by decide +kernel
 
 /-! ### C3, as stated in the spec -/
 

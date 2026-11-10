@@ -170,6 +170,33 @@ fn c4_cache_ttl_policy() {
             response("x.test", ok, &[], None),
             None,
         ),
+        // TTLs with the top bit set count as 0 (RFC 2181 §8). Regression
+        // for #21.
+        (
+            "top bit set: not cached",
+            response("x.test", ok, &[0x8000_0000], None),
+            None,
+        ),
+        (
+            "one TTL with the top bit is enough",
+            response("x.test", ok, &[600, 0xFFFF_FFFF], None),
+            None,
+        ),
+        (
+            "2³¹ − 1 is the largest TTL",
+            response("x.test", ok, &[0x7FFF_FFFF], None),
+            Some(0x7FFF_FFFF),
+        ),
+        (
+            "SOA TTL with the top bit",
+            response("x.test", NXDOMAIN_FLAGS, &[], Some((0x8000_0000, 900))),
+            None,
+        ),
+        (
+            "SOA MINIMUM with the top bit",
+            response("x.test", NXDOMAIN_FLAGS, &[], Some((900, 0xFFFF_FFFF))),
+            None,
+        ),
     ];
     for (what, packet, want) in cases {
         assert_eq!(cache_ttl(packet), *want, "{what}");
