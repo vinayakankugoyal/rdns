@@ -346,3 +346,7 @@ impl DNSPacket {
         (answers, offset)
     }
 }
+
+#[cfg(test)]
+#[path = "spec/packet_spec.rs"]
+mod spec;

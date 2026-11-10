@@ -21,6 +21,10 @@ mod metrics;
 mod packet;
 mod tui;
 
+#[cfg(test)]
+#[path = "spec/forwarder_spec.rs"]
+mod forwarder_spec;
+
 /// Maximum size of a UDP DNS message (RFC 1035).
 const MAX_PACKET_SIZE: usize = 512;
 

@@ -68,3 +68,7 @@ impl DNSCache {
             .retain(|_, entry| entry.expiration > now);
     }
 }
+
+#[cfg(test)]
+#[path = "spec/cache_spec.rs"]
+mod spec;
