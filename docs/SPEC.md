@@ -202,7 +202,7 @@ scripted upstream resolver and client.
 | F7 | Blocked names are answered locally, in any case, with a well-typed answer (B1, L2) | `f7_blocking` |
 | F8 | **✗** [#16](https://github.com/vinayakankugoyal/rdns/issues/16) **CD isolation:** a client that leaves CD clear never gets data the upstream would only return with CD set, i.e. data that failed the upstream's DNSSEC validation (RFC 4035 §3.2.2) | [`bug_cd_bypasses_validation`](../formal/Rdns/Forwarder.lean) (refuted) |
 | F9 | **✗** [#19](https://github.com/vinayakankugoyal/rdns/issues/19) A client that leaves DO clear gets no RRSIG, NSEC or NSEC3 records it didn't ask for (RFC 4035 §3.2.1) | (refuted; reproduced end to end) |
-| F10 | **✗** [#22](https://github.com/vinayakankugoyal/rdns/issues/22) A message with an opcode other than QUERY gets NOTIMP and is neither answered from the cache or blocklist nor forwarded (RFC 1035 §4.1.1) | [`bug_opcode_ignored`](../formal/Rdns/Forwarder.lean) (refuted) |
+| F10 | A message with an opcode other than QUERY gets NOTIMP and is neither answered from the cache or blocklist nor forwarded (RFC 1035 §4.1.1). Regression for [#22](https://github.com/vinayakankugoyal/rdns/issues/22) | `f10_other_opcodes_get_notimp`; **proof** ([`other_opcodes_notimp`](../formal/Rdns/Forwarder.lean), whatever is cached) |
 
 How F1 and F2 are achieved: each forwarded query uses its own UDP socket,
 on a port the kernel picks, connected to the resolver so that the kernel

@@ -29,6 +29,8 @@ validates cached data itself. rdns is not a validating cache.)
 
 namespace Rdns
 
+def RCODE_NOTIMP : UInt8 := 4
+
 /-- The CD bit: bit 4 of byte 3, the low bit of Rust's `z`. -/
 def Header.cd (h : Header) : Bool := h.z &&& 0x01 = 0x01
 
@@ -59,6 +61,8 @@ that CD bit. Returns the RCODE and answers the client gets, and the new
 cache. -/
 def handle (cache : Option (Question × Entry)) (upstream : Bool → Packet) (q : Packet) :
     (UInt8 × Array Answer) × Option (Question × Entry) :=
+  -- Only standard queries are served; anything else gets NOTIMP (#22).
+  if q.header.opcode ≠ 0 then ((RCODE_NOTIMP, #[]), cache) else
   match cacheKey q with
   | none => ((RCODE_SERVFAIL, #[]), cache)  -- dropped; modelled as an error
   | some k =>
@@ -117,20 +121,19 @@ example : (({ name := #[3, 87, 119, 119, 0], tp := 1, cls := 1 } : Question).sam
 
 /-! ## Opcode -/
 
-def RCODE_NOTIMP : UInt8 := 4
-
-/-- **RFC 1035 §4.1.1**: a server returns NOTIMP ("the name server does not
-support the requested kind of query") for opcodes it doesn't implement.
-rdns implements only QUERY (0). -/
+/-- **F10, RFC 1035 §4.1.1**: a server returns NOTIMP ("the name server does
+not support the requested kind of query") for opcodes it doesn't
+implement. rdns implements only QUERY (0). -/
 def OtherOpcodesNotImp : Prop :=
   ∀ (cache : Option (Question × Entry)) (upstream : Bool → Packet) (q : Packet),
-    q.header.opcode ≠ 0 → ((handle cache upstream q).1).1 = RCODE_NOTIMP
+    q.header.opcode ≠ 0 → (handle cache upstream q).1 = (RCODE_NOTIMP, #[])
+      ∧ (handle cache upstream q).2 = cache
 
-/-- **Counterexample.** An UPDATE (opcode 5) for a cached name gets the cached
-answer, NOERROR. -/
-theorem bug_opcode_ignored : ¬ OtherOpcodesNotImp := fun h => by
-  have := h (handle none validatingUpstream (query true)).2 validatingUpstream
-    { query false with header := { (query false).header with opcode := 5 } } (by decide)
-  revert this; decide +kernel
+/-- Every non-QUERY message gets NOTIMP with no records and leaves the cache
+alone, whatever is cached. Until #22 an UPDATE for a cached name got the
+cached answer. -/
+theorem other_opcodes_notimp : OtherOpcodesNotImp := by
+  intro cache upstream q h
+  simp [handle, h]
 
 end Rdns

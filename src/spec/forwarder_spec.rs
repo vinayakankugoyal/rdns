@@ -4,7 +4,7 @@
 //! scripted fake upstream resolver and a fake client.
 
 use super::*;
-use crate::packet::{RCODE_NXDOMAIN, TYPE_AAAA};
+use crate::packet::{RCODE_NOTIMP, RCODE_NXDOMAIN, TYPE_AAAA};
 
 fn wire(name: &str) -> Vec<u8> {
     let mut out = Vec::new();
@@ -430,6 +430,43 @@ async fn f6_relay_is_verbatim() {
     let r = h.client_recv().await;
     assert_eq!(id_of(&r), 0x0102);
     assert_eq!(r[2..], nx[2..]);
+}
+
+/// F10. A message with an opcode other than QUERY gets NOTIMP with its own
+/// opcode, and is neither answered from the cache or blocklist nor
+/// forwarded (RFC 1035 §4.1.1). Before the fix, a NOTIFY for a cached name
+/// got the cached A record. Regression for #22.
+#[tokio::test]
+async fn f10_other_opcodes_get_notimp() {
+    let h = Harness::new().await;
+    let up = h.forward(query(1, "cached.test")).await;
+    h.reply(
+        &up,
+        &message(
+            id_of(&up.query),
+            0x8180,
+            [1, 0, 0],
+            "cached.test",
+            &a_record(600, [192, 0, 2, 1]),
+        ),
+    )
+    .await;
+    let _ = h.client_recv().await;
+    h.server
+        .blocklist
+        .replace(["blocked.test".to_string()].into());
+
+    for opcode in [1u16, 2, 4, 5, 15] {
+        for name in ["cached.test", "blocked.test", "other.test"] {
+            h.ask(message(9, opcode << 11, [0, 0, 0], name, &[]));
+            let r = h.client_recv().await;
+            assert_eq!(rcode_of(&r), RCODE_NOTIMP, "opcode {opcode}, {name}");
+            assert_eq!(u16::from(r[2] >> 3 & 0x0f), opcode);
+            let p = DNSPacket::from_bytes(&r).unwrap();
+            assert!(p.answers.is_empty(), "opcode {opcode}, {name}: answered");
+        }
+    }
+    assert!(h.upstream_is_quiet().await, "a non-QUERY went upstream");
 }
 
 /// F7. Blocked names are blocked in any case, with a well-typed answer.

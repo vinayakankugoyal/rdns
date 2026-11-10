@@ -20,6 +20,10 @@ pub const TYPE_OPT: u16 = 41;
 pub const RCODE_NOERROR: u8 = 0;
 pub const RCODE_SERVFAIL: u8 = 2;
 pub const RCODE_NXDOMAIN: u8 = 3;
+pub const RCODE_NOTIMP: u8 = 4;
+
+/// OPCODE of a standard query (RFC 1035 §4.1.1), the only kind rdns serves.
+pub const OPCODE_QUERY: u8 = 0;
 
 /// Size of the fixed DNS header in bytes.
 const HEADER_LEN: usize = 12;
