@@ -21,6 +21,10 @@ pub const RCODE_NOERROR: u8 = 0;
 pub const RCODE_SERVFAIL: u8 = 2;
 pub const RCODE_NXDOMAIN: u8 = 3;
 
+/// The CD (checking disabled) bit within `Header::z`, which holds the Z,
+/// AD and CD bits of byte 3 (RFC 4035 §3.2).
+pub const Z_CD: u8 = 0x01;
+
 /// Size of the fixed DNS header in bytes.
 const HEADER_LEN: usize = 12;
 
