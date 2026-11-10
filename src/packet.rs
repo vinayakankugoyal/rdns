@@ -16,6 +16,9 @@ pub const TYPE_A: u16 = 1;
 pub const TYPE_SOA: u16 = 6;
 pub const TYPE_AAAA: u16 = 28;
 pub const TYPE_OPT: u16 = 41;
+pub const TYPE_RRSIG: u16 = 46;
+pub const TYPE_NSEC: u16 = 47;
+pub const TYPE_NSEC3: u16 = 50;
 
 pub const RCODE_NOERROR: u8 = 0;
 pub const RCODE_SERVFAIL: u8 = 2;
@@ -450,6 +453,15 @@ impl DNSPacket {
         let mut buf = self.response_bytes(rcode, &[], &[], 0);
         buf[2] |= 0x02;
         buf
+    }
+
+    /// Whether the query's EDNS OPT record sets DO ("DNSSEC OK", the top
+    /// bit of the flags in the OPT TTL; RFC 3225).
+    pub fn dnssec_ok(&self) -> bool {
+        self.resources
+            .iter()
+            .find(|r| r.tp == TYPE_OPT)
+            .is_some_and(|opt| opt.ttl & 0x8000 != 0)
     }
 
     /// The largest UDP response this query's sender can receive: the

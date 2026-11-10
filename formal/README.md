@@ -35,6 +35,8 @@ lake build    # checks every proof
 | `readName_wf` (Name) | **P2, first half**: every decoded name is well formed (labels of 1–63 bytes, then the root) and at most 255 bytes |
 | `readName_consumed` (Name) | the bytes a name occupies are ≥ 1 and within the buffer |
 | `no_underflow` (Name) | in every loop state where Rust evaluates `pos + 2 - start` or `pos - start`, `start ≤ pos` |
+| `negative_entries_keep_proofs` (Cache) | **C5, DNSSEC part**: a cached negative answer keeps every SOA, NSEC, NSEC3 and RRSIG of its authority section (the counterexample until [#19](https://github.com/vinayakankugoyal/rdns/issues/19)) |
+| `do_isolation` (Forwarder) | **F9**: an entry stored for one DO bit never answers a query with the other |
 | `r1_response_header` (Packet) | **R1, header part**: QR = 1, TC = AA = 0, the given RCODE, the query's ID |
 | `served_record_never_outlives_ttl` (Cache) | the TTL arithmetic: a record served at age ⌈t⌉ is dropped downstream by `max(t, its own expiry)` |
 | `positive_entries_never_stale` (Cache) | without `--min-cache-ttl`, a NOERROR response with answers is never served after any of its records has expired |
@@ -50,7 +52,6 @@ anything about sockets, timeouts or transaction IDs.
 | `bug_cd_bypasses_validation` (Forwarder) | a CD = 0 client never gets data a validating upstream refused it | [#16](https://github.com/vinayakankugoyal/rdns/issues/16) |
 | `bug_cache_hit_loses_compression` (Packet) | a cache hit fits the client whenever the relayed response did | [#17](https://github.com/vinayakankugoyal/rdns/issues/17) |
 | `bug_cname_nxdomain_stale`, `bug_cname_nodata_stale`, `bug_cname_nxdomain_drops_soa`, `bug_c4_spec_mismatch` (Cache) | records and negative answers are never served past their TTL; C4 | [#18](https://github.com/vinayakankugoyal/rdns/issues/18) |
-| `bug_negative_entries_drop_nsec` (Cache) | negative entries keep their NSEC/RRSIG (RFC 2308 §5) | [#19](https://github.com/vinayakankugoyal/rdns/issues/19) |
 | `bug_negative_ttl_extended` (Cache) | downstream never holds a negative answer past its negative TTL | [#20](https://github.com/vinayakankugoyal/rdns/issues/20) |
 | `bug_high_bit_ttl_cached` (Cache) | TTLs ≥ 2³¹ count as 0 (RFC 2181 §8) | [#21](https://github.com/vinayakankugoyal/rdns/issues/21) |
 | `bug_opcode_ignored` (Forwarder) | non-QUERY opcodes get NOTIMP | [#22](https://github.com/vinayakankugoyal/rdns/issues/22) |

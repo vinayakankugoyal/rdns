@@ -8,6 +8,11 @@
 //! * truncated responses, error responses (SERVFAIL, REFUSED, …) and
 //!   anything with a TTL of 0 are not cached.
 //!
+//! Entries are keyed by the question *and* the query's DO bit, so a client
+//! that asked for DNSSEC records gets them and one that didn't gets none
+//! (RFC 4035 §3.2.1). A negative entry keeps the SOA and the NSEC, NSEC3
+//! and RRSIG records that prove the non-existence (RFC 2308 §5).
+//!
 //! An operator-chosen minimum lifetime (`--min-cache-ttl`) can extend how
 //! long entries are kept, but records are always served with their
 //! *remaining* TTL, saturating at 0, so downstream caches never hold them
@@ -19,7 +24,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::packet::{Answer, DNSPacket, Question, RCODE_NOERROR, RCODE_NXDOMAIN};
+use crate::packet::{
+    Answer, DNSPacket, Question, RCODE_NOERROR, RCODE_NXDOMAIN, TYPE_NSEC, TYPE_NSEC3, TYPE_RRSIG,
+};
 
 /// The parts of an upstream response the cache replays.
 #[derive(Debug)]
@@ -44,12 +51,12 @@ pub struct CacheHit {
     pub age: u32,
 }
 
-/// A thread-safe DNS response cache keyed by question.
+/// A thread-safe DNS response cache keyed by question and DO bit.
 ///
 /// Responses are stored behind an `Arc` so lookups hand out a cheap
 /// reference instead of cloning every record.
 pub struct DNSCache {
-    store: RwLock<HashMap<Question, CacheEntry>>,
+    store: RwLock<HashMap<(Question, bool), CacheEntry>>,
     /// Minimum time (seconds) an entry is kept, regardless of record TTLs.
     min_ttl: u32,
 }
@@ -83,14 +90,17 @@ impl DNSCache {
         }
     }
 
-    /// Returns the cached response for `q`, if present and not expired.
-    pub fn get(&self, q: &Question) -> Option<CacheHit> {
-        self.get_at(q, Instant::now())
+    /// Returns the cached response for `q` asked with DO = `dnssec_ok`, if
+    /// present and not expired.
+    pub fn get(&self, q: &Question, dnssec_ok: bool) -> Option<CacheHit> {
+        self.get_at(q, dnssec_ok, Instant::now())
     }
 
-    fn get_at(&self, q: &Question, now: Instant) -> Option<CacheHit> {
+    fn get_at(&self, q: &Question, dnssec_ok: bool, now: Instant) -> Option<CacheHit> {
         let cache = self.store.read().unwrap();
-        let entry = cache.get(q).filter(|entry| entry.expiration > now)?;
+        let entry = cache
+            .get(&(q.clone(), dnssec_ok))
+            .filter(|entry| entry.expiration > now)?;
         let age = now.saturating_duration_since(entry.inserted);
         let age = age.as_secs() + u64::from(age.subsec_nanos() > 0);
         Some(CacheHit {
@@ -99,13 +109,13 @@ impl DNSCache {
         })
     }
 
-    /// Caches `response` under `q` if [`cache_ttl`] allows it. Returns
-    /// whether it was cached.
-    pub fn insert(&self, q: Question, response: DNSPacket) -> bool {
-        self.insert_at(q, response, Instant::now())
+    /// Caches `response`, the answer to `q` asked with DO = `dnssec_ok`, if
+    /// [`cache_ttl`] allows it. Returns whether it was cached.
+    pub fn insert(&self, q: Question, dnssec_ok: bool, response: DNSPacket) -> bool {
+        self.insert_at(q, dnssec_ok, response, Instant::now())
     }
 
-    fn insert_at(&self, q: Question, response: DNSPacket, now: Instant) -> bool {
+    fn insert_at(&self, q: Question, dnssec_ok: bool, response: DNSPacket, now: Instant) -> bool {
         let Some(ttl) = cache_ttl(&response) else {
             return false;
         };
@@ -114,7 +124,9 @@ impl DNSCache {
             response
                 .authorities
                 .into_iter()
-                .filter(|a| a.soa_minimum().is_some())
+                .filter(|a| {
+                    a.soa_minimum().is_some() || [TYPE_NSEC, TYPE_NSEC3, TYPE_RRSIG].contains(&a.tp)
+                })
                 .collect()
         } else {
             Vec::new()
@@ -128,7 +140,7 @@ impl DNSCache {
             inserted: now,
             expiration: now + Duration::from_secs(ttl.max(self.min_ttl).into()),
         };
-        self.store.write().unwrap().insert(q, entry);
+        self.store.write().unwrap().insert((q, dnssec_ok), entry);
         true
     }
 

@@ -201,7 +201,8 @@ async fn handle_dns_request(server: Arc<Server>, data: Vec<u8>, source: SocketAd
         return;
     }
 
-    if let Some(hit) = server.cache.get(question) {
+    let dnssec_ok = packet.dnssec_ok();
+    if let Some(hit) = server.cache.get(question, dnssec_ok) {
         metrics::CACHE_HITS.inc();
         let latency = record_latency(start);
 
@@ -247,7 +248,7 @@ async fn handle_dns_request(server: Arc<Server>, data: Vec<u8>, source: SocketAd
         latency.as_millis()
     ));
 
-    server.cache.insert(question.clone(), upstream);
+    server.cache.insert(question.clone(), dnssec_ok, upstream);
 }
 
 /// Records the time since `start` in the latency metrics and returns it.

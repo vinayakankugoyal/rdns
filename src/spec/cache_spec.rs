@@ -53,9 +53,10 @@ fn c1_insert_then_get() {
     let c = DNSCache::new(0);
     assert!(c.insert(
         question("example.com"),
+        false,
         response("example.com", NOERROR_FLAGS, &[600], None)
     ));
-    let hit = c.get(&question("example.com")).unwrap();
+    let hit = c.get(&question("example.com"), false).unwrap();
     assert_eq!(hit.response.rcode, RCODE_NOERROR);
     assert_eq!(hit.response.answers[0].data, [1, 2, 3, 4]);
 }
@@ -67,18 +68,20 @@ fn c2_cleanup_removes_only_expired() {
     let t0 = Instant::now();
     c.insert_at(
         question("a.test"),
+        false,
         response("a.test", NOERROR_FLAGS, &[60], None),
         t0,
     );
     c.insert_at(
         question("b.test"),
+        false,
         response("b.test", NOERROR_FLAGS, &[600], None),
         t0,
     );
     c.cleanup(t0 + Duration::from_secs(60));
     let store = c.store.read().unwrap();
-    assert!(!store.contains_key(&question("a.test")));
-    assert!(store.contains_key(&question("b.test")));
+    assert!(!store.contains_key(&(question("a.test"), false)));
+    assert!(store.contains_key(&(question("b.test"), false)));
 }
 
 /// C3. Served TTL ≤ remaining lifetime of the entry, for every age and
@@ -90,13 +93,14 @@ fn c3_served_ttl_never_exceeds_remaining_lifetime_exhaustive() {
         let t0 = Instant::now();
         c.insert_at(
             question("example.com"),
+            false,
             response("example.com", NOERROR_FLAGS, &[600], None),
             t0,
         );
         let lifetime = Duration::from_secs(600u64.max(min_ttl.into()));
         for ms in (0..=1_100_000).step_by(250) {
             let now = t0 + Duration::from_millis(ms);
-            let hit = c.get_at(&question("example.com"), now);
+            let hit = c.get_at(&question("example.com"), false, now);
             assert_eq!(
                 hit.is_some(),
                 now < t0 + lifetime,
@@ -181,11 +185,48 @@ fn c4_cache_ttl_policy() {
 fn c5_negative_entries_keep_rcode_and_soa() {
     let c = DNSCache::new(0);
     let r = response("nope.test", NXDOMAIN_FLAGS, &[], Some((3600, 900)));
-    assert!(c.insert(question("nope.test"), r));
-    let hit = c.get(&question("nope.test")).unwrap();
+    assert!(c.insert(question("nope.test"), false, r));
+    let hit = c.get(&question("nope.test"), false).unwrap();
     assert_eq!(hit.response.rcode, RCODE_NXDOMAIN);
     assert_eq!(hit.response.authorities.len(), 1);
     assert_eq!(hit.response.authorities[0].soa_minimum(), Some(900));
+}
+
+/// C5″. A signed negative entry keeps the NSEC, NSEC3 and RRSIG records
+/// that prove the non-existence, with the SOA (RFC 2308 §5). Other
+/// authority records are still dropped. Regression for #19.
+#[test]
+fn c5_negative_entries_keep_dnssec_proofs() {
+    let mut r = response("nope.test", NXDOMAIN_FLAGS, &[], Some((300, 300)));
+    for tp in [TYPE_NSEC, TYPE_NSEC3, TYPE_RRSIG, 2] {
+        r.authorities.push(Answer {
+            name: wire("nope.test"),
+            tp,
+            class: 1,
+            ttl: 300,
+            data: vec![0; 8],
+        });
+    }
+    let c = DNSCache::new(0);
+    assert!(c.insert(question("nope.test"), true, r));
+    let hit = c.get(&question("nope.test"), true).unwrap();
+    let types: Vec<u16> = hit.response.authorities.iter().map(|a| a.tp).collect();
+    assert_eq!(types, [6, TYPE_NSEC, TYPE_NSEC3, TYPE_RRSIG]);
+}
+
+/// C9. Entries are keyed by the DO bit as well as the question: an answer
+/// fetched for a DO=1 query (with RRSIGs) is never served to a DO=0 query,
+/// and vice versa (RFC 4035 §3.2.1). Regression for #19.
+#[test]
+fn c9_entries_are_keyed_by_do() {
+    let c = DNSCache::new(0);
+    assert!(c.insert(
+        question("signed.test"),
+        true,
+        response("signed.test", NOERROR_FLAGS, &[600], None)
+    ));
+    assert!(c.get(&question("signed.test"), false).is_none());
+    assert!(c.get(&question("signed.test"), true).is_some());
 }
 
 /// C6. Lookups ignore the case of the name. Regression for #8.
@@ -194,8 +235,9 @@ fn c6_lookups_ignore_case() {
     let c = DNSCache::new(0);
     c.insert(
         question("Example.COM"),
+        false,
         response("Example.COM", NOERROR_FLAGS, &[600], None),
     );
-    assert!(c.get(&question("example.com")).is_some());
-    assert!(c.get(&question("EXAMPLE.com")).is_some());
+    assert!(c.get(&question("example.com"), false).is_some());
+    assert!(c.get(&question("EXAMPLE.com"), false).is_some());
 }

@@ -60,13 +60,18 @@ structure Entry where
   lifetime : Nat
   deriving Repr
 
+/-- The authority records a negative entry keeps: the SOA, and the NSEC,
+NSEC3 and RRSIG records that prove the non-existence (RFC 2308 §5). -/
+def keptInNegative (a : Answer) : Bool :=
+  a.soaMinimum.isSome || a.tp == TYPE_NSEC || a.tp == TYPE_NSEC3 || a.tp == TYPE_RRSIG
+
 /-- `DNSCache::insert_at` with `min_ttl`: the entry stored, if any. -/
 def insertEntry (minTtl : UInt32) (r : Packet) : Option Entry :=
   match cacheTtl r with
   | none => none
   | some ttl =>
     let negative := r.answers.isEmpty
-    let authorities := if negative then r.authorities.filter (·.soaMinimum.isSome) else #[]
+    let authorities := if negative then r.authorities.filter keptInNegative else #[]
     some { response := { rcode := r.header.rcode, answers := r.answers, authorities }
            lifetime := (max ttl minTtl).toNat }
 
@@ -394,23 +399,26 @@ theorem c3_as_stated_is_false : ¬ C3 := fun h =>
 def nsec : Answer := { name := nm, tp := 47, cls := 1, ttl := 300, data := #[0, 0, 6, 0, 0, 0, 3] }
 def rrsig : Answer := { name := nm, tp := 46, cls := 1, ttl := 300, data := #[0, 6, 13, 2] }
 
-/-- **RFC 2308 §5**: "The NXT record, if it exists in the authority section
-of a negative answer received, MUST be stored such that it can be be
-located and returned with SOA record in the authority section, as should
-any SIG records in the authority section." (NSEC and RRSIG today.) -/
-def keepsProofsAt (r : Packet) : Bool :=
-  match insertEntry 0 r with
-  | some e => e.response.authorities.size == r.authorities.size
-  | none => true
+/-- **C5, DNSSEC part (RFC 2308 §5)**: "The NXT record, if it exists in the
+authority section of a negative answer received, MUST be stored such that
+it can be be located and returned with SOA record in the authority
+section, as should any SIG records in the authority section." (NSEC,
+NSEC3 and RRSIG today.) Every such record of a cached negative answer is
+replayed. Until #19 only the SOA was. -/
+theorem negative_entries_keep_proofs (minTtl : UInt32) (r : Packet) (e : Entry)
+    (hneg : r.answers.isEmpty = true) (hins : insertEntry minTtl r = some e) :
+    ∀ a ∈ r.authorities, keptInNegative a = true → a ∈ e.response.authorities := by
+  unfold insertEntry at hins
+  split at hins
+  · simp at hins
+  · simp only [Option.some.injEq] at hins
+    subst hins
+    intro a ha hk
+    simp only [hneg, ↓reduceIte]
+    exact Array.mem_filter.mpr ⟨ha, hk⟩
 
-def NegativeEntriesKeepProofs : Prop :=
-  ∀ r : Packet, r.answers.isEmpty = true → keepsProofsAt r = true
-
-/-- **Counterexample.** `insert_at` keeps only the SOA, so a signed NXDOMAIN
-(SOA, NSEC, RRSIG) is replayed without its proof of non-existence, and a
-validating stub behind rdns can't validate the cached answer. -/
-theorem bug_negative_entries_drop_nsec : ¬ NegativeEntriesKeepProofs := fun h =>
-  absurd (h (resp RCODE_NXDOMAIN #[] #[soa 3600 300, nsec, rrsig]) (by decide +kernel))
-    (by decide +kernel)
+/-- The former counterexample: a signed NXDOMAIN keeps SOA, NSEC and RRSIG. -/
+example : (insertEntry 0 (resp RCODE_NXDOMAIN #[] #[soa 3600 300, nsec, rrsig])).map
+    (·.response.authorities.size) = some 3 := by decide +kernel
 
 end Rdns

@@ -41,10 +41,15 @@ def Question.same (a b : Question) : Bool :=
   a.tp == b.tp && a.cls == b.cls && a.name.size == b.name.size
     && (a.name.zip b.name).all (fun p => asciiLower p.1 == asciiLower p.2)
 
-/-- The key `handle_dns_request` uses for `cache.get` and `cache.insert`. -/
-def cacheKey (q : Packet) : Option Question := q.questions[0]?
+/-- The key `handle_dns_request` uses for `cache.get` and `cache.insert`:
+the first question and the query's DO bit (#19). -/
+def cacheKey (q : Packet) : Option (Question × Bool) := q.questions[0]?.map (·, q.dnssecOk)
 
-/-- The cache key doesn't depend on the query header at all. -/
+/-- Key equality: `Question`'s case-insensitive `Eq`, and the DO bit. -/
+def keySame (a b : Question × Bool) : Bool := a.1.same b.1 && a.2 == b.2
+
+/-- The cache key doesn't depend on the query header at all. (DO lives in
+the OPT record, not the header.) -/
 theorem cacheKey_ignores_header (q : Packet) (h : Header) :
     cacheKey { q with header := h } = cacheKey q := rfl
 
@@ -57,18 +62,18 @@ TTL aging. `upstream cd` is the response the
 upstream resolver gives for the query's question when the query carries
 that CD bit. Returns the RCODE and answers the client gets, and the new
 cache. -/
-def handle (cache : Option (Question × Entry)) (upstream : Bool → Packet) (q : Packet) :
-    (UInt8 × Array Answer) × Option (Question × Entry) :=
+def handle (cache : Option ((Question × Bool) × Entry)) (upstream : Bool → Packet) (q : Packet) :
+    (UInt8 × Array Answer) × Option ((Question × Bool) × Entry) :=
   match cacheKey q with
   | none => ((RCODE_SERVFAIL, #[]), cache)  -- dropped; modelled as an error
   | some k =>
     match cache with
     | some (k', e) =>
-      if k'.same k then ((e.response.rcode, e.response.answers), cache)
+      if keySame k' k then ((e.response.rcode, e.response.answers), cache)
       else forward k
     | none => forward k
 where
-  forward (k : Question) :=
+  forward (k : Question × Bool) :=
     let r := upstream q.header.cd
     ((r.header.rcode, r.answers),
      match insertEntry 0 r with
@@ -123,7 +128,7 @@ def RCODE_NOTIMP : UInt8 := 4
 support the requested kind of query") for opcodes it doesn't implement.
 rdns implements only QUERY (0). -/
 def OtherOpcodesNotImp : Prop :=
-  ∀ (cache : Option (Question × Entry)) (upstream : Bool → Packet) (q : Packet),
+  ∀ (cache : Option ((Question × Bool) × Entry)) (upstream : Bool → Packet) (q : Packet),
     q.header.opcode ≠ 0 → ((handle cache upstream q).1).1 = RCODE_NOTIMP
 
 /-- **Counterexample.** An UPDATE (opcode 5) for a cached name gets the cached
@@ -132,5 +137,16 @@ theorem bug_opcode_ignored : ¬ OtherOpcodesNotImp := fun h => by
   have := h (handle none validatingUpstream (query true)).2 validatingUpstream
     { query false with header := { (query false).header with opcode := 5 } } (by decide)
   revert this; decide +kernel
+
+/-! ## DO isolation (#19) -/
+
+/-- **F9.** An entry stored for a query with one DO bit never answers a
+query with the other: the query is forwarded instead. -/
+theorem do_isolation (k : Question × Bool) (e : Entry) (upstream : Bool → Packet) (q : Packet)
+    (kq : Question) (hk : cacheKey q = some (kq, !k.2)) :
+    handle (some (k, e)) upstream q = handle.forward (some (k, e)) upstream q (kq, !k.2) := by
+  unfold handle
+  rw [hk]
+  simp [keySame]
 
 end Rdns
