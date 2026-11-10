@@ -1,0 +1,12 @@
+name = "rdns-formal"
+version = "0.1.0"
+defaultTargets = ["Rdns", "rdns-model"]
+
+[[lean_lib]]
+name = "Rdns"
+
+# Command-line front end to the Lean model, used for differential testing
+# against the Rust implementation (see `differential/`).
+[[lean_exe]]
+name = "rdns-model"
+root = "Main"
