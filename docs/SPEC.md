@@ -4,8 +4,15 @@ This document says precisely what rdns guarantees, and how each guarantee
 is checked. It exists because writing it down found bugs: the first draft
 of this spec, checked against rdns 0.1.0, turned up eleven
 ([#3](https://github.com/vinayakankugoyal/rdns/issues/3)–[#13](https://github.com/vinayakankugoyal/rdns/issues/13)),
-including a remote crash and a cache-poisoning weakness. Every property
-below now holds, and each has a test that fails if it stops holding.
+including a remote crash and a cache-poisoning weakness. All eleven are
+fixed, and each has a test that fails if it comes back.
+
+A second pass modelled rdns in Lean 4 ([`formal/`](../formal)) and proved
+the properties that hold. It found ten more ([#15](https://github.com/vinayakankugoyal/rdns/issues/15)–[#24](https://github.com/vinayakankugoyal/rdns/issues/24)), among them a
+forged DNSSEC "authenticated" bit and a way for any client to turn off
+the upstream's DNSSEC validation. These are still open, and the
+properties they break are marked **✗** below. Each such property states
+what rdns *should* do. None was weakened to fit the code.
 
 - [How to read this](#how-to-read-this)
 - [Definitions](#definitions)
@@ -15,6 +22,7 @@ below now holds, and each has a test that fails if it stops holding.
 - [4. Blocklist](#4-blocklist)
 - [5. Forwarder, end to end](#5-forwarder-end-to-end)
 - [Bugs this spec found](#bugs-this-spec-found)
+- [Bugs the Lean model found](#bugs-the-lean-model-found)
 - [What this spec does not cover](#what-this-spec-does-not-cover)
 
 ## How to read this
@@ -27,17 +35,22 @@ they describe, and run with the rest of the suite:
 cargo test
 ```
 
-There are four kinds of check:
+There are five kinds of check:
 
 | Check | Meaning |
 |-------|---------|
+| **proof** | A theorem about a Lean model of the code ([`formal/`](../formal)), checked by Lean's kernel. The model is compared with the Rust code on 200,000 generated messages (`formal/differential`). |
 | **exhaustive** | The whole input domain (or the whole of the part that matters) is enumerated. |
 | **bounded** | A fixed-seed generator produces up to 200,000 inputs, so every run checks the same cases. |
 | **witness** | Specific inputs, chosen to hit a case that once failed. |
 | **argument** | A short proof in the source, backed by a test. |
 
-These are checks, not machine-verified proofs. An exhaustive check is as
-good as a proof for its domain; a bounded check is strong evidence. See
+A **proof** covers every input, but it is about the model, so it is only
+as good as the model's fidelity. That is why the differential test exists.
+An exhaustive check is as good as a proof for its domain; a bounded check
+is strong evidence. **✗** marks a property rdns violates today. Its
+counterexample is a Lean theorem `bug_…`, and the issue reproduces it on
+the real binary. See
 [What this spec does not cover](#what-this-spec-does-not-cover).
 
 ## Definitions
@@ -82,9 +95,9 @@ Tests: [`src/spec/packet_spec.rs`](../src/spec/packet_spec.rs)
 
 | ID | Property | Check | Test |
 |----|----------|-------|------|
-| H1 | Header codec is a bijection: `write(read(b)) = b` for every `b ∈ Byte¹²` | exhaustive over the two flag bytes (2¹⁶ values) | `h1_header_roundtrip_exhaustive` |
-| P1 | **Totality:** `parse` terminates on every input | argument + bounded (50k random messages, pointers included) + witness (3 pointer cycles, in a child process) | `p1_parser_total_on_random_inputs`, `p1_pointer_cycles_terminate` |
-| P2 | **Soundness:** if `parse(m) = p` then every name `n` in `p` has `WF(n)` and `n = ref(m, i)` for the offset `i` it was read from | bounded (200k random names) + witness | `p2_parsed_names_are_sound`, `p2_truncated_names_rejected`, `p2_overlong_names_rejected` |
+| H1 | Header codec is a bijection: `write(read(b)) = b` for every `b ∈ Byte¹²` | **proof** ([`h1_header_roundtrip`](../formal/Rdns/Wire.lean)) + exhaustive over the two flag bytes (2¹⁶ values) | `h1_header_roundtrip_exhaustive` |
+| P1 | **Totality:** `parse` terminates on every input | **proof** ([`readNameLoop`](../formal/Rdns/Name.lean) is a total function) + bounded (50k random messages, pointers included) + witness (3 pointer cycles, in a child process) | `p1_parser_total_on_random_inputs`, `p1_pointer_cycles_terminate` |
+| P2 | **Soundness:** if `parse(m) = p` then every name `n` in `p` has `WF(n)` and `n = ref(m, i)` for the offset `i` it was read from; the bytes it occupies lie inside `m`, and the decoder's offset arithmetic never underflows | **proof** of `WF(n)`, the bytes occupied and no underflow ([`readName_wf`, `readName_consumed`, `no_underflow`](../formal/Rdns/Name.lean)); bounded (200k random names) + witness for `n = ref(m, i)` | `p2_parsed_names_are_sound`, `p2_truncated_names_rejected`, `p2_overlong_names_rejected` |
 | P3 | **Completeness:** every message whose names are well formed and compressed only with backward pointers is accepted, and each name decodes to the name that was encoded | bounded (5k random messages with suffix compression) | `p3_well_formed_messages_parse` |
 | P4 | **Self-contained records:** names inside the RDATA of NS, MD, MF, CNAME, SOA, MB, MG, MR, PTR, MINFO, MX, RP, AFSDB, RT and SRV are decompressed; a record copied into another message decodes to the same thing; RDATA whose fields don't exactly fill RDLENGTH is rejected | witness | `p4_soa_rdata_is_self_contained`, `p4_name_bearing_rdata_is_decompressed`, `p4_rdata_length_mismatch_rejected` |
 | P5 | **No partial parses:** every proper prefix of a valid message is rejected | exhaustive over all prefixes | `p5_truncated_sections_rejected_exhaustive` |
@@ -97,7 +110,9 @@ backwards (RFC 1035: a pointer refers to a *prior* occurrence) and stops at
 255-byte limit bounds, or jumps to a strictly smaller offset, so pointers
 alone can't repeat. The loop therefore runs at most
 `255 + |m|` times. It is a loop rather than recursion, so stack depth is
-constant.
+constant. The Lean model is accepted only with this argument as a
+termination proof (the measure `(256 − |name|, pos)` decreases
+lexicographically at every step), so the argument is machine-checked.
 
 ## 2. Synthesized responses
 
@@ -107,6 +122,9 @@ constant.
 | R1 | `response_bytes` answers the query: same ID and question, QR = 1, TC = 0, the given RCODE, and section counts equal to the records written | bounded (2k) | `r1_response_bytes_shape` |
 | R2 | Each served TTL is `ttl(r) ⊖ age`, where `⊖` is subtraction saturating at 0 | exhaustive over ages 0–700, plus `u32::MAX` | `r2_ttls_are_aged` |
 | R3 | The truncated form of a response is TC = 1 with the question and no records (RFC 2181 §9) | witness | `r3_truncated_bytes_shape` |
+| R4 | **✗** [#15](https://github.com/vinayakankugoyal/rdns/issues/15) A synthesized response never has AD or Z set; CD is copied from the query (RFC 4035 §3.2.2, §3.2.3; RFC 1035 §4.1.1). rdns validates nothing, so it must not claim AD | refuted | [`bug_ad_bit_forged`](../formal/Rdns/Packet.lean) |
+| R5 | **✗** [#23](https://github.com/vinayakankugoyal/rdns/issues/23) A response to a query with an OPT record carries an OPT record (RFC 6891 §7) | refuted | [`bug_opt_missing`](../formal/Rdns/Packet.lean) |
+| R6 | **✗** [#17](https://github.com/vinayakankugoyal/rdns/issues/17) A response served from the cache is no larger than the relayed response it was built from, apart from TTLs, so a client that got the relayed answer also gets the cached one (needs name compression) | refuted (295 bytes relayed, 825 cached) | [`bug_cache_hit_loses_compression`](../formal/Rdns/Packet.lean) |
 
 ## 3. Cache
 
@@ -117,16 +135,24 @@ The cache lifetime of a response `r` is
 
 ```
 cache_ttl(r) =
-  ⊥                                  if TC(r) = 1
-  min { ttl(a) | a ∈ answers(r) }    if rcode(r) = NOERROR and answers(r) ≠ ∅
-  min(ttl(s), MINIMUM(s))            if rcode(r) ∈ {NOERROR, NXDOMAIN}, answers(r) = ∅,
-                                        and s is an SOA in authorities(r)
-  ⊥                                  otherwise (errors; negative answers without an SOA)
+  ⊥                       if TC(r) = 1
+  min(A(r), N(r))         if rcode(r) = NOERROR,
+                             or rcode(r) = NXDOMAIN and authorities(r) has an SOA
+  ⊥                       otherwise (errors; NXDOMAIN without an SOA)
 
-and is ⊥ whenever the value above is 0.
+where
+  A(r) = min { ttl(a) | a ∈ answers(r) }             (∞ if there are no answers)
+  N(r) = min(ttl(s), MINIMUM(s)) for the first SOA s in authorities(r)
+                                                     (∞ if there is none)
+  a TTL with the top bit set counts as 0             (RFC 2181 §8)
+
+and is ⊥ whenever the value above is 0 or ∞.
 ```
 
-where `⊥` means "don't cache" (RFC 1035 §3.2.1, RFC 2308 §5). An entry is
+where `⊥` means "don't cache" (RFC 1035 §3.2.1, RFC 2308 §5). A response
+with both answers and an SOA is a negative answer reached through a CNAME
+(RFC 2308 §2.1, §2.2), and both bounds apply. The code uses only one of
+them ([#18](https://github.com/vinayakankugoyal/rdns/issues/18)) and ignores the top bit ([#21](https://github.com/vinayakankugoyal/rdns/issues/21)). An entry is
 kept for `max(cache_ttl(r), min_cache_ttl)`, where `min_cache_ttl` is the
 `--min-cache-ttl` flag (default 0).
 
@@ -134,14 +160,17 @@ kept for `max(cache_ttl(r), min_cache_ttl)`, where `min_cache_ttl` is the
 |----|----------|-------|------|
 | C1 | `get(q)` after `insert(q, r)` replays `r`'s answers while the entry is live | witness | `c1_insert_then_get` |
 | C2 | `cleanup(t)` removes exactly the entries that have expired by `t` | witness | `c2_cleanup_removes_only_expired` |
-| C3 | **Honest TTLs:** at any time `t` the entry is live, every served TTL ≤ its remaining lifetime; and the entry is live exactly until it expires | exhaustive over `t` in 250 ms steps across the entry's life, for `min_cache_ttl ∈ {0, 300, 1000}` | `c3_served_ttl_never_exceeds_remaining_lifetime_exhaustive` |
-| C4 | The cache stores exactly what `cache_ttl` above allows | witness, one case per branch | `c4_cache_ttl_policy` |
-| C5 | A negative entry replays its RCODE and SOA | witness | `c5_negative_entries_keep_rcode_and_soa` |
+| C3 | **Honest TTLs:** a record served at time `t` with TTL `s` is dropped downstream by `max(t, its own expiry)`, whatever `min_cache_ttl` is; and the entry is live exactly until it expires. (An earlier wording, "every served TTL ≤ the entry's remaining lifetime", is false for entries with records of different TTLs; see [#24](https://github.com/vinayakankugoyal/rdns/issues/24) and [`c3_as_stated_is_false`](../formal/Rdns/Cache.lean).) | **proof** of the TTL arithmetic ([`served_record_never_outlives_ttl`](../formal/Rdns/Cache.lean)) + exhaustive over `t` in 250 ms steps across a one-record entry's life, for `min_cache_ttl ∈ {0, 300, 1000}` | `c3_served_ttl_never_exceeds_remaining_lifetime_exhaustive` |
+| C4 | **✗** [#18](https://github.com/vinayakankugoyal/rdns/issues/18), [#21](https://github.com/vinayakankugoyal/rdns/issues/21) The cache stores exactly what `cache_ttl` above allows | witness, one case per branch; refuted for NXDOMAIN behind a CNAME and for TTLs ≥ 2³¹ | `c4_cache_ttl_policy`, [`bug_c4_spec_mismatch`, `bug_high_bit_ttl_cached`](../formal/Rdns/Cache.lean) |
+| C5 | **✗** [#18](https://github.com/vinayakankugoyal/rdns/issues/18), [#19](https://github.com/vinayakankugoyal/rdns/issues/19) A negative entry replays its RCODE, its SOA and the NSEC/NSEC3/RRSIG records of its authority section (RFC 2308 §5), including when it also has answers | witness; refuted for signed and CNAME negatives | `c5_negative_entries_keep_rcode_and_soa`, [`bug_negative_entries_drop_nsec`, `bug_cname_nxdomain_drops_soa`](../formal/Rdns/Cache.lean) |
 | C6 | Lookups use `≡`, so names differing only in case share an entry | witness | `c6_lookups_ignore_case` |
+| C7 | **✗** [#18](https://github.com/vinayakankugoyal/rdns/issues/18) **Nothing stale:** with `min_cache_ttl = 0`, no record is served after its TTL and no negative answer after its negative TTL | **proof** for NOERROR responses with answers ([`positive_entries_never_stale`](../formal/Rdns/Cache.lean)); refuted for negative answers behind a CNAME | [`bug_cname_nxdomain_stale`, `bug_cname_nodata_stale`](../formal/Rdns/Cache.lean) |
+| C8 | **✗** [#20](https://github.com/vinayakankugoyal/rdns/issues/20) **Honest negative TTLs:** a downstream resolver given a cached negative answer stops believing it by the time its negative TTL runs out, so the served SOA's TTL is at most `min(ttl(s), MINIMUM(s)) ⊖ age` (RFC 2308 §5) | refuted | [`bug_negative_ttl_extended`](../formal/Rdns/Cache.lean) |
 
 C3 is what makes `--min-cache-ttl` safe. rdns may keep a record longer
 than its TTL, but it then serves it with TTL 0, so no downstream cache keeps
-it any longer.
+it any longer. C8 is the same promise for negative answers, where the
+deadline is carried by the SOA, not by a record of the answer.
 
 ## 4. Blocklist
 
@@ -171,6 +200,9 @@ scripted upstream resolver and client.
 | F5 | No client gets a response larger than its UDP limit (E1); a response that would exceed it becomes the truncated form (R3), and clients advertising a larger size get the whole response. Upstream replies are read into a 64 KiB buffer, so none is ever cut short, whatever size the client advertised | `f5_large_responses_respect_client_limit` |
 | F6 | A relayed response is byte-for-byte the upstream's apart from the ID, so record types rdns doesn't understand pass through intact | `f6_relay_is_verbatim` |
 | F7 | Blocked names are answered locally, in any case, with a well-typed answer (B1, L2) | `f7_blocking` |
+| F8 | **✗** [#16](https://github.com/vinayakankugoyal/rdns/issues/16) **CD isolation:** a client that leaves CD clear never gets data the upstream would only return with CD set, i.e. data that failed the upstream's DNSSEC validation (RFC 4035 §3.2.2) | [`bug_cd_bypasses_validation`](../formal/Rdns/Forwarder.lean) (refuted) |
+| F9 | **✗** [#19](https://github.com/vinayakankugoyal/rdns/issues/19) A client that leaves DO clear gets no RRSIG, NSEC or NSEC3 records it didn't ask for (RFC 4035 §3.2.1) | (refuted; reproduced end to end) |
+| F10 | **✗** [#22](https://github.com/vinayakankugoyal/rdns/issues/22) A message with an opcode other than QUERY gets NOTIMP and is neither answered from the cache or blocklist nor forwarded (RFC 1035 §4.1.1) | [`bug_opcode_ignored`](../formal/Rdns/Forwarder.lean) (refuted) |
 
 How F1 and F2 are achieved: each forwarded query uses its own UDP socket,
 on a port the kernel picks, connected to the resolver so that the kernel
@@ -213,16 +245,45 @@ them (disabling the backward-pointer rule, and the 255-byte limit) make
 the parser loop forever. The suite detects this by hanging, which is why
 P1's cycle witnesses run in a child process.
 
+## Bugs the Lean model found
+
+Against `70e3552` (rdns after PR #14). Each issue reproduces the bug on
+the real binary ([`formal/repro/e2e.py`](../formal/repro/e2e.py)) and links its
+Lean counterexample.
+
+| Issue | Property | What is wrong | Severity |
+|-------|----------|---------------|----------|
+| [#15](https://github.com/vinayakankugoyal/rdns/issues/15) | R4 | Cached, blocked and SERVFAIL responses copy the query's AD bit (`dig` sets it by default), claiming DNSSEC validation rdns never did | medium |
+| [#16](https://github.com/vinayakankugoyal/rdns/issues/16) | F8 | The cache ignores CD, so one CD = 1 query from anyone turns off the upstream's DNSSEC validation for a name, for every client | medium |
+| [#17](https://github.com/vinayakankugoyal/rdns/issues/17) | R6 | Cache hits are written without name compression, so a response that fit in 512 bytes comes back as TC = 1 from the cache | medium |
+| [#18](https://github.com/vinayakankugoyal/rdns/issues/18) | C4, C5, C7 | NXDOMAIN/NODATA behind a CNAME are cached on the wrong TTL and replayed without their SOA | low–medium |
+| [#19](https://github.com/vinayakankugoyal/rdns/issues/19) | C5, F9 | Negative entries drop NSEC/RRSIG; RRSIGs are served to DO = 0 clients | low–medium |
+| [#20](https://github.com/vinayakankugoyal/rdns/issues/20) | C8 | A cached SOA's TTL isn't capped at MINIMUM, so downstream negative caching restarts | low |
+| [#21](https://github.com/vinayakankugoyal/rdns/issues/21) | C4 | TTLs with the top bit set are cached for up to 136 years | low |
+| [#22](https://github.com/vinayakankugoyal/rdns/issues/22) | F10 | Non-QUERY opcodes are answered from the cache instead of NOTIMP | low |
+| [#23](https://github.com/vinayakankugoyal/rdns/issues/23) | R5 | Synthesized responses to EDNS queries omit OPT | low |
+| [#24](https://github.com/vinayakankugoyal/rdns/issues/24) | C3 | C3 was stated too strongly (spec bug; the code was fine) | docs |
+
+The model was checked the way the tests were. A second agent that hadn't
+written it compared it with the Rust code and mutated it to see whether the
+proofs still passed. That found three proofs weaker than their
+descriptions; they were strengthened. It also found [#17](https://github.com/vinayakankugoyal/rdns/issues/17). Planted bugs in
+the model are caught by the differential test, and a self-pointer in the
+name decoder makes the model fail to compile.
+
 ## What this spec does not cover
 
-- **Proofs.** The checks are tests in Rust, not proofs in a theorem prover.
-  Exhaustive checks cover their whole domain; bounded checks don't, so a
-  bug in a case no generator reaches could survive. The argument for P1 is
-  written in the source, not machine-checked.
+- **Proofs of everything.** H1, P1, half of P2, C3's arithmetic and C7 for
+  positive answers are proved in Lean; the rest are tests. A proof is about
+  the Lean model, which is compared with the Rust code by differential
+  testing, not derived from it. The model leaves out sockets, timeouts and
+  transaction IDs (F1, F2). Bounded checks don't cover their whole domain,
+  so a bug in a case no generator reaches could survive.
 - **TCP.** rdns serves UDP only. Truncated responses tell clients to retry
   over TCP, which rdns doesn't offer.
-- **DNSSEC.** rdns doesn't validate. It relays DNSSEC records verbatim
-  (F6), but synthesized and cached responses carry no signatures.
+- **DNSSEC validation.** rdns doesn't validate. It relays DNSSEC records
+  verbatim (F6), and must not claim or undermine validation it doesn't do
+  (R4, F8, F9).
 - **Resource limits.** The cache isn't bounded in size, and nothing limits
   query rate.
 - **The TUI, metrics endpoint and blocklist download** are outside the

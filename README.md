@@ -69,6 +69,16 @@ It's the reason they're fixed and the reason they stay fixed.
 cargo test    # check every property
 ```
 
+A [Lean 4 model](formal/README.md) of the codec and cache proves the parser
+terminates on every input and only ever returns well-formed names, and
+found [ten more bugs](docs/SPEC.md#bugs-the-lean-model-found), among them a
+forged DNSSEC "authenticated" bit. Those are open; the spec marks the
+properties they break.
+
+```bash
+cd formal && lake build    # check every proof (needs only the Lean toolchain)
+```
+
 ## Nix ❄️
 
 For those who have ascended beyond mere package managers, `rdns` is a flake.
