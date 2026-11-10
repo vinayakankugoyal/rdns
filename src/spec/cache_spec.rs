@@ -188,6 +188,40 @@ fn c5_negative_entries_keep_rcode_and_soa() {
     assert_eq!(hit.response.authorities[0].soa_minimum(), Some(900));
 }
 
+/// C8. Honest negative TTLs: a downstream resolver given a cached negative
+/// answer at any time `t` caches it for `min(served SOA TTL, MINIMUM)`,
+/// and that never reaches past the negative TTL `min(SOA TTL, MINIMUM)`
+/// set by the authority, whatever `min_cache_ttl` is. Before the fix the
+/// SOA was replayed with its full TTL, so at t = 299.5 s an SOA with TTL
+/// 3600 and MINIMUM 300 told downstream to keep the NXDOMAIN until
+/// t = 599.5 s. Regression for #20.
+#[test]
+fn c8_negative_ttls_are_honest_exhaustive() {
+    for min_ttl in [0, 300, 3600] {
+        for (soa_ttl, minimum) in [(3600, 300), (300, 3600), (86400, 60)] {
+            let negative_ttl = u64::from(soa_ttl.min(minimum));
+            let c = DNSCache::new(min_ttl);
+            let t0 = Instant::now();
+            let r = response("nope.test", NXDOMAIN_FLAGS, &[], Some((soa_ttl, minimum)));
+            c.insert_at(question("nope.test"), r, t0);
+            for ms in (0..=4_000_000).step_by(500) {
+                let t = Duration::from_millis(ms);
+                let Some(hit) = c.get_at(&question("nope.test"), t0 + t) else {
+                    continue;
+                };
+                let soa = &hit.response.authorities[0];
+                let served = soa.ttl.saturating_sub(hit.age);
+                let held = u64::from(served.min(soa.soa_minimum().unwrap()));
+                let until = t + Duration::from_secs(held);
+                assert!(
+                    until <= t.max(Duration::from_secs(negative_ttl)),
+                    "min_ttl={min_ttl} soa=({soa_ttl},{minimum}) t={ms}ms: held until {until:?}"
+                );
+            }
+        }
+    }
+}
+
 /// C6. Lookups ignore the case of the name. Regression for #8.
 #[test]
 fn c6_lookups_ignore_case() {

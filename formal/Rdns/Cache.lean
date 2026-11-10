@@ -60,13 +60,17 @@ structure Entry where
   lifetime : Nat
   deriving Repr
 
+/-- `filter_map(|mut a| { a.ttl = a.ttl.min(a.soa_minimum()?); Some(a) })`:
+keep SOAs, with their TTL capped at MINIMUM (#20). -/
+def capSoa (a : Answer) : Option Answer := a.soaMinimum.map (fun m => { a with ttl := min a.ttl m })
+
 /-- `DNSCache::insert_at` with `min_ttl`: the entry stored, if any. -/
 def insertEntry (minTtl : UInt32) (r : Packet) : Option Entry :=
   match cacheTtl r with
   | none => none
   | some ttl =>
     let negative := r.answers.isEmpty
-    let authorities := if negative then r.authorities.filter (·.soaMinimum.isSome) else #[]
+    let authorities := if negative then r.authorities.filterMap capSoa else #[]
     some { response := { rcode := r.header.rcode, answers := r.answers, authorities }
            lifetime := (max ttl minTtl).toNat }
 
@@ -273,16 +277,95 @@ it by the time the authority's negative TTL runs out (or at `t`, if that
 has already passed). -/
 def NegativeAnswersHonest : Prop := ∀ minTtl r t, negHonestAt minTtl r t = true
 
-/-- **Counterexample.** An NXDOMAIN whose SOA has TTL 3600 and MINIMUM 300:
-RFC 2308 gives it a negative TTL of 300 s. rdns keeps it 300 s, but
-served at t = 299.5 s the SOA says TTL 3300, MINIMUM 300, so the
-downstream resolver keeps the NXDOMAIN until t = 599.5 s. -/
-theorem bug_negative_ttl_extended : ¬ NegativeAnswersHonest := fun h =>
-  absurd (h 0 (resp RCODE_NXDOMAIN #[] #[soa 3600 300]) 299500000000) (by decide +kernel)
+theorem soaMinimum_with_ttl (a : Answer) (x : UInt32) :
+    ({ a with ttl := x } : Answer).soaMinimum = a.soaMinimum := rfl
 
-/-- With `--min-cache-ttl 3600` the same answer is believed for up to
-3600 + 300 s. -/
-example : negHonestAt 3600 (resp RCODE_NXDOMAIN #[] #[soa 86400 300]) (3599 * NS) = false := by
+/-- A record that is just a TTL: `servedTtl` looks at nothing else. -/
+def ttlOnly (x : UInt32) : Answer := { (default : Answer) with ttl := x }
+
+theorem ttlOnly_ttl (x : UInt32) : (ttlOnly x).ttl = x := rfl
+
+theorem servedTtl_ttl (a : Answer) (t : Nat) : servedTtl a t = servedTtl (ttlOnly a.ttl) t := rfl
+
+/-- The first SOA a downstream resolver sees in the capped authority
+section is the first SOA of the original one, with its TTL capped. -/
+theorem findSome_capSoa (l : List Answer) (t : Nat) :
+    (l.filterMap capSoa).findSome? (fun a => a.soaMinimum.map (fun m => (servedTtl a t, m)))
+      = (l.findSome? (fun a => a.soaMinimum.map (fun m => (a.ttl, m)))).map
+          (fun p => (servedTtl (ttlOnly (min p.1 p.2)) t, p.2)) := by
+  induction l with
+  | nil => rfl
+  | cons a l ih =>
+    cases hm : a.soaMinimum with
+    | none =>
+      have hc : capSoa a = none := by simp [capSoa, hm]
+      rw [List.filterMap_cons_none hc, ih, List.findSome?_cons_of_isNone (by simp [hm])]
+    | some m =>
+      have hc : capSoa a = some { a with ttl := min a.ttl m } := by simp [capSoa, hm]
+      have hs : ({ a with ttl := min a.ttl m } : Answer).soaMinimum = some m := by
+        rw [soaMinimum_with_ttl, hm]
+      rw [List.filterMap_cons_some hc, List.findSome?_cons_of_isSome (by rw [hs]; rfl),
+        List.findSome?_cons_of_isSome (by rw [hm]; rfl)]
+      simp only [hs, hm, Option.map_some]
+      rw [servedTtl_ttl]
+
+theorem live_age (e : Entry) (t : Nat) (hl : e.lifetime < 2 ^ 32) (h : e.live t) :
+    ageAt t < 2 ^ 32 := by
+  have := ageAt_lt t
+  simp only [Entry.live] at h
+  have : ageAt t * NS < 2 ^ 32 * NS := by
+    have := Nat.mul_le_mul_right NS (Nat.succ_le_of_lt hl); unfold NS at *; omega
+  exact Nat.lt_of_mul_lt_mul_right this
+
+/-- **C8, honest negative TTLs.** Whatever `min_ttl` is, a downstream
+resolver handed a cached negative answer at `t` stops believing it by the
+time the authority's negative TTL runs out (or at `t`, if that has already
+passed). This was false until #20 (`t = 299.5 s`, SOA TTL 3600, MINIMUM
+300: held until 599.5 s). -/
+theorem negative_answers_honest : NegativeAnswersHonest := by
+  intro minTtl r t
+  unfold negHonestAt
+  split
+  · next e n hins hn =>
+    split
+    · next hlive =>
+      split
+      · next m hm =>
+        unfold insertEntry at hins
+        split at hins
+        · simp at hins
+        · next ttl _ =>
+          simp only [Option.some.injEq] at hins
+          subst hins
+          have hlt : (max ttl minTtl).toNat < 2 ^ 32 := (max ttl minTtl).toNat_lt
+          have hage := live_age _ t hlt hlive
+          split at hm
+          · next hneg =>
+            simp only [downstreamNegTtl, ← Array.findSome?_toList, Array.toList_filterMap,
+              findSome_capSoa] at hm
+            simp only [negTtl, ← Array.findSome?_toList] at hn
+            cases hf : r.authorities.toList.findSome?
+                (fun a => a.soaMinimum.map (fun m => (a.ttl, m))) with
+            | none => simp [hf] at hn
+            | some p =>
+              simp only [hf, Option.map_some, Option.some.injEq] at hm hn
+              subst hm hn
+              have key := served_record_never_outlives_ttl (ttlOnly (min p.1 p.2)) t hage
+              have hmin : (min p.1 p.2).toNat = min p.1.toNat p.2.toNat := by
+                rw [UInt32.min_def]; split <;> simp_all [UInt32.le_iff_toNat_le] <;> omega
+              rw [ttlOnly_ttl, hmin] at key
+              have : min (servedTtl (ttlOnly (min p.1 p.2)) t) p.2.toNat
+                  * NS ≤ servedTtl (ttlOnly (min p.1 p.2)) t * NS :=
+                Nat.mul_le_mul_right NS (Nat.min_le_left _ _)
+              simp only [decide_eq_true_eq]
+              omega
+          · simp [downstreamNegTtl] at hm
+      · rfl
+    · rfl
+  · rfl
+
+/-- The former counterexample, now honest. -/
+example : negHonestAt 0 (resp RCODE_NXDOMAIN #[] #[soa 3600 300]) 299500000000 = true := by
   decide +kernel
 
 /-! ### Negative answers behind a CNAME are cached on the wrong TTL -/

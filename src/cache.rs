@@ -4,7 +4,8 @@
 //!
 //! * a NOERROR response with answers lives for its smallest record TTL;
 //! * a negative response (NXDOMAIN, or NOERROR with no answers) lives for
-//!   `min(SOA TTL, SOA MINIMUM)` and is not cached without an SOA;
+//!   `min(SOA TTL, SOA MINIMUM)`, is replayed with its SOA's TTL capped at
+//!   that value, and is not cached without an SOA;
 //! * truncated responses, error responses (SERVFAIL, REFUSED, …) and
 //!   anything with a TTL of 0 are not cached.
 //!
@@ -110,11 +111,19 @@ impl DNSCache {
             return false;
         };
         let negative = response.answers.is_empty();
+        // The SOA is stored with TTL min(TTL, MINIMUM), the negative TTL,
+        // as RFC 2308 §5 has authoritative servers send it. Served with
+        // its remaining TTL, it then tells downstream resolvers how much
+        // of the negative TTL is left; replaying the full SOA TTL would let
+        // each of them restart the clock at MINIMUM.
         let authorities = if negative {
             response
                 .authorities
                 .into_iter()
-                .filter(|a| a.soa_minimum().is_some())
+                .filter_map(|mut a| {
+                    a.ttl = a.ttl.min(a.soa_minimum()?);
+                    Some(a)
+                })
                 .collect()
         } else {
             Vec::new()
