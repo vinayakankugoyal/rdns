@@ -36,6 +36,7 @@ lake build    # checks every proof
 | `readName_consumed` (Name) | the bytes a name occupies are ≥ 1 and within the buffer |
 | `no_underflow` (Name) | in every loop state where Rust evaluates `pos + 2 - start` or `pos - start`, `start ≤ pos` |
 | `r1_response_header` (Packet) | **R1, header part**: QR = 1, TC = AA = 0, the given RCODE, the query's ID |
+| `no_forged_ad` (Packet) | **R4**: no synthesized response has AD or Z set, for every query, RCODE and record set (the counterexample until [#15](https://github.com/vinayakankugoyal/rdns/issues/15) was fixed) |
 | `served_record_never_outlives_ttl` (Cache) | the TTL arithmetic: a record served at age ⌈t⌉ is dropped downstream by `max(t, its own expiry)` |
 | `positive_entries_never_stale` (Cache) | without `--min-cache-ttl`, a NOERROR response with answers is never served after any of its records has expired |
 
@@ -46,7 +47,6 @@ anything about sockets, timeouts or transaction IDs.
 
 | Theorem | Property refuted | Issue |
 |---------|------------------|-------|
-| `bug_ad_bit_forged` (Packet) | synthesized responses never claim AD | [#15](https://github.com/vinayakankugoyal/rdns/issues/15) |
 | `bug_cd_bypasses_validation` (Forwarder) | a CD = 0 client never gets data a validating upstream refused it | [#16](https://github.com/vinayakankugoyal/rdns/issues/16) |
 | `bug_cache_hit_loses_compression` (Packet) | a cache hit fits the client whenever the relayed response did | [#17](https://github.com/vinayakankugoyal/rdns/issues/17) |
 | `bug_cname_nxdomain_stale`, `bug_cname_nodata_stale`, `bug_cname_nxdomain_drops_soa`, `bug_c4_spec_mismatch` (Cache) | records and negative answers are never served past their TTL; C4 | [#18](https://github.com/vinayakankugoyal/rdns/issues/18) |
