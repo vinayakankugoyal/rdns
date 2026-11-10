@@ -1,0 +1,12 @@
+[package]
+name = "rdns-differential"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Compiles rdns's own `src/packet.rs` and `src/cache.rs` (no copies) and
+# compares them with the Lean model on generated inputs. No dependencies,
+# so it builds offline.
+[dependencies]
+
+[workspace]
