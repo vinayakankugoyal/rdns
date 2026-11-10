@@ -3,17 +3,36 @@
 //! Implements the subset of RFC 1035 needed by the forwarder: header,
 //! question, and resource-record encoding, including decompression of
 //! name pointers in responses.
+//!
+//! Parsing is strict: a message with a malformed name, a truncated section
+//! or RDATA that doesn't match its declared length is rejected as a whole
+//! (`from_bytes` returns `None`) rather than partially decoded. The
+//! properties this module guarantees are listed in `docs/SPEC.md`.
 
 use std::fmt::Display;
+use std::hash::{Hash, Hasher};
 
-/// DNS record types that embed a (possibly compressed) domain name in RDATA.
-const TYPE_NS: u16 = 2;
-const TYPE_CNAME: u16 = 5;
-const TYPE_MX: u16 = 15;
-const TYPE_PTR: u16 = 12;
+pub const TYPE_A: u16 = 1;
+pub const TYPE_SOA: u16 = 6;
+pub const TYPE_AAAA: u16 = 28;
+pub const TYPE_OPT: u16 = 41;
+
+pub const RCODE_NOERROR: u8 = 0;
+pub const RCODE_SERVFAIL: u8 = 2;
+pub const RCODE_NXDOMAIN: u8 = 3;
 
 /// Size of the fixed DNS header in bytes.
 const HEADER_LEN: usize = 12;
+
+/// Largest UDP payload a client may receive without EDNS (RFC 1035 §4.2.1).
+pub const DEFAULT_UDP_PAYLOAD: usize = 512;
+
+/// Largest UDP payload rdns will send or receive.
+pub const MAX_UDP_PAYLOAD: usize = 4096;
+
+/// Maximum length of a domain name in wire format, including the root
+/// label (RFC 1035 §2.3.4).
+const MAX_NAME_LEN: usize = 255;
 
 /// TTL (seconds) used for synthesized answers to blocked queries.
 const BLOCKED_TTL: u32 = 300;
@@ -65,12 +84,37 @@ impl Header {
     }
 }
 
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+/// A question. Equality and hashing treat the name case-insensitively, as
+/// DNS does (RFC 4343), so it can key the cache and match responses.
+#[derive(Debug, Clone)]
 pub struct Question {
     /// Domain name in uncompressed wire format (length-prefixed labels).
     pub name: Vec<u8>,
     pub tp: u16,
     pub class: u16,
+}
+
+impl PartialEq for Question {
+    fn eq(&self, other: &Self) -> bool {
+        // Length octets are < 64, so they never fall in the ASCII letter
+        // range and case folding only touches label bytes.
+        self.tp == other.tp
+            && self.class == other.class
+            && self.name.eq_ignore_ascii_case(&other.name)
+    }
+}
+
+impl Eq for Question {}
+
+impl Hash for Question {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name.len().hash(state);
+        for b in &self.name {
+            b.to_ascii_lowercase().hash(state);
+        }
+        self.tp.hash(state);
+        self.class.hash(state);
+    }
 }
 
 impl Question {
@@ -80,16 +124,22 @@ impl Question {
         buf.extend_from_slice(&self.class.to_be_bytes());
     }
 
-    /// Synthesizes an answer pointing at 0.0.0.0 for blocklisted queries.
-    pub fn to_blocked_answer(&self) -> Answer {
-        Answer {
+    /// Synthesizes the answer for a blocklisted query: `0.0.0.0` for A,
+    /// `::` for AAAA, and no record (an empty NOERROR) for any other type,
+    /// since no other type has an "unroutable" value.
+    pub fn to_blocked_answer(&self) -> Option<Answer> {
+        let data = match self.tp {
+            TYPE_A => vec![0; 4],
+            TYPE_AAAA => vec![0; 16],
+            _ => return None,
+        };
+        Some(Answer {
             name: self.name.clone(),
             tp: self.tp,
             class: self.class,
             ttl: BLOCKED_TTL,
-            length: 4,
-            data: vec![0, 0, 0, 0],
-        }
+            data,
+        })
     }
 
     /// Returns the domain name in dotted presentation form (e.g. `example.com`).
@@ -126,18 +176,29 @@ pub struct Answer {
     pub tp: u16,
     pub class: u16,
     pub ttl: u32,
-    pub length: u16,
+    /// RDATA, with any embedded domain names decompressed.
     pub data: Vec<u8>,
 }
 
 impl Answer {
-    fn write_to(&self, buf: &mut Vec<u8>) {
+    /// Writes the record, reducing its TTL by `age` seconds (saturating).
+    fn write_to(&self, buf: &mut Vec<u8>, age: u32) {
         buf.extend_from_slice(&self.name);
         buf.extend_from_slice(&self.tp.to_be_bytes());
         buf.extend_from_slice(&self.class.to_be_bytes());
-        buf.extend_from_slice(&self.ttl.to_be_bytes());
-        buf.extend_from_slice(&self.length.to_be_bytes());
+        buf.extend_from_slice(&self.ttl.saturating_sub(age).to_be_bytes());
+        buf.extend_from_slice(&(self.data.len() as u16).to_be_bytes());
         buf.extend_from_slice(&self.data);
+    }
+
+    /// For an SOA record, the MINIMUM field (the last 4 bytes of RDATA),
+    /// which bounds how long a negative answer may be cached (RFC 2308).
+    pub fn soa_minimum(&self) -> Option<u32> {
+        if self.tp != TYPE_SOA || self.data.len() < 20 {
+            return None;
+        }
+        let m = &self.data[self.data.len() - 4..];
+        Some(u32::from_be_bytes([m[0], m[1], m[2], m[3]]))
     }
 }
 
@@ -153,6 +214,109 @@ impl Display for Answer {
     }
 }
 
+/// One field of an RDATA layout.
+enum Field {
+    /// A (possibly compressed) domain name.
+    Name,
+    /// A fixed number of opaque bytes.
+    Fixed(usize),
+}
+
+/// RDATA layout of the record types that may carry compressed names: the
+/// RFC 1035 types, plus RP, AFSDB, RT and SRV, which receivers are asked
+/// to decompress (RFC 3597 §4). RDATA of every other type is opaque.
+fn rdata_layout(tp: u16) -> Option<&'static [Field]> {
+    use Field::*;
+    match tp {
+        // NS, MD, MF, CNAME, MB, MG, MR, PTR
+        2 | 3 | 4 | 5 | 7 | 8 | 9 | 12 => Some(&[Name]),
+        // SOA: MNAME, RNAME, SERIAL, REFRESH, RETRY, EXPIRE, MINIMUM
+        6 => Some(&[Name, Name, Fixed(20)]),
+        // MINFO, RP
+        14 | 17 => Some(&[Name, Name]),
+        // MX, AFSDB, RT: 16-bit preference + name
+        15 | 18 | 21 => Some(&[Fixed(2), Name]),
+        // SRV: priority, weight, port + target
+        33 => Some(&[Fixed(6), Name]),
+        _ => None,
+    }
+}
+
+/// A bounds-checked cursor over a message.
+struct Reader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn bytes(&mut self, n: usize) -> Option<&'a [u8]> {
+        let out = self.buf.get(self.pos..self.pos.checked_add(n)?)?;
+        self.pos += n;
+        Some(out)
+    }
+
+    fn u16(&mut self) -> Option<u16> {
+        self.bytes(2).map(|b| u16::from_be_bytes([b[0], b[1]]))
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        self.bytes(4)
+            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn name(&mut self) -> Option<Vec<u8>> {
+        let (name, used) = read_name(self.buf, self.pos)?;
+        self.pos += used;
+        Some(name)
+    }
+}
+
+/// Decodes the domain name at `start`, following compression pointers.
+///
+/// Returns the uncompressed name and the number of bytes the name occupies
+/// at `start`, or `None` if the name is malformed: truncated, longer than
+/// 255 bytes, using a reserved label type, or containing a pointer that
+/// doesn't point strictly backwards (RFC 1035 §4.1.4: a pointer refers to a
+/// *prior* occurrence).
+///
+/// Termination: every step either appends a label (the 255-byte limit
+/// bounds these) or follows a pointer to a strictly smaller offset (so
+/// pointers alone can't repeat); hence the loop runs at most
+/// `MAX_NAME_LEN + buf.len()` times.
+fn read_name(buf: &[u8], start: usize) -> Option<(Vec<u8>, usize)> {
+    let mut name = Vec::new();
+    let mut pos = start;
+    // Bytes consumed at `start`, fixed by the first pointer.
+    let mut used = None;
+    loop {
+        let b = *buf.get(pos)?;
+        match b & 0xC0 {
+            0xC0 => {
+                let low = *buf.get(pos + 1)?;
+                let target = ((b as usize & 0x3F) << 8) | low as usize;
+                if target >= pos {
+                    return None;
+                }
+                used.get_or_insert_with(|| pos + 2 - start);
+                pos = target;
+            }
+            0x00 => {
+                let label = buf.get(pos..pos + 1 + b as usize)?;
+                if name.len() + label.len() > MAX_NAME_LEN {
+                    return None;
+                }
+                name.extend_from_slice(label);
+                pos += label.len();
+                if b == 0 {
+                    return Some((name, used.unwrap_or_else(|| pos - start)));
+                }
+            }
+            // 0b01 / 0b10 label types are reserved (RFC 6891 §5).
+            _ => return None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DNSPacket {
     pub header: Header,
@@ -165,186 +329,143 @@ pub struct DNSPacket {
 impl DNSPacket {
     /// Parses a packet from raw bytes.
     ///
-    /// Returns `None` if the buffer is too short to contain a DNS header.
-    /// Truncated or malformed sections beyond the header yield partial
-    /// results rather than an error.
+    /// Returns `None` if the message is malformed: too short for a header,
+    /// a section shorter than its header count, a malformed name, or RDATA
+    /// whose decoded fields don't exactly fill RDLENGTH.
     pub fn from_bytes(buf: &[u8]) -> Option<Self> {
-        if buf.len() < HEADER_LEN {
-            return None;
+        let header = Header::from_bytes(buf.get(..HEADER_LEN)?);
+        let mut r = Reader {
+            buf,
+            pos: HEADER_LEN,
+        };
+        // Cap preallocation by what the buffer could possibly hold, so a
+        // forged count can't make us allocate for 65535 records.
+        let cap = |count: u16| (count as usize).min(buf.len() / 5);
+
+        let mut questions = Vec::with_capacity(cap(header.qdcount));
+        for _ in 0..header.qdcount {
+            questions.push(Question {
+                name: r.name()?,
+                tp: r.u16()?,
+                class: r.u16()?,
+            });
         }
-        let header = Header::from_bytes(&buf[..HEADER_LEN]);
-        let (questions, offset) = Self::parse_questions(buf, HEADER_LEN, header.qdcount);
-        let (answers, offset) = Self::parse_answers(buf, offset, header.ancount);
-        let (authorities, offset) = Self::parse_answers(buf, offset, header.nscount);
-        let (resources, _) = Self::parse_answers(buf, offset, header.arcount);
+        let sections = [header.ancount, header.nscount, header.arcount].map(|count| {
+            let mut records = Vec::with_capacity(cap(count));
+            for _ in 0..count {
+                records.push(Self::read_record(&mut r)?);
+            }
+            Some(records)
+        });
+        let [answers, authorities, resources] = sections;
         Some(Self {
             header,
             questions,
-            answers,
-            authorities,
-            resources,
+            answers: answers?,
+            authorities: authorities?,
+            resources: resources?,
         })
     }
 
-    /// Serializes the packet to wire format.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(512);
-        self.header.write_to(&mut buf);
-        for q in &self.questions {
-            q.write_to(&mut buf);
+    fn read_record(r: &mut Reader) -> Option<Answer> {
+        let name = r.name()?;
+        let tp = r.u16()?;
+        let class = r.u16()?;
+        let ttl = r.u32()?;
+        let length = r.u16()? as usize;
+        let end = r.pos.checked_add(length)?;
+        if end > r.buf.len() {
+            return None;
         }
-        for a in self
-            .answers
-            .iter()
-            .chain(&self.authorities)
-            .chain(&self.resources)
-        {
-            a.write_to(&mut buf);
-        }
-        buf
+
+        // Names inside RDATA are decompressed so the record stays valid
+        // once it is copied out of this message (into the cache, or into
+        // a re-serialized message where offsets have moved).
+        let data = match rdata_layout(tp) {
+            None => r.bytes(length)?.to_vec(),
+            Some(layout) => {
+                let mut data = Vec::with_capacity(length);
+                for field in layout {
+                    match field {
+                        Field::Name => data.extend(r.name()?),
+                        Field::Fixed(n) => data.extend_from_slice(r.bytes(*n)?),
+                    }
+                    if r.pos > end {
+                        return None;
+                    }
+                }
+                if r.pos != end {
+                    return None;
+                }
+                data
+            }
+        };
+        Some(Answer {
+            name,
+            tp,
+            class,
+            ttl,
+            data,
+        })
     }
 
-    /// Serializes a response to this query carrying the given answers,
-    /// without taking ownership of them.
+    /// Serializes a response to this query.
     ///
-    /// The header is copied from the query with the response flags set and
-    /// authority/additional sections dropped.
-    pub fn response_bytes(&self, answers: &[Answer]) -> Vec<u8> {
+    /// The header is copied from the query with QR and RA set, the given
+    /// RCODE, and counts matching the records written. Every TTL is
+    /// reduced by `age` seconds, the time the records spent in the cache.
+    pub fn response_bytes(
+        &self,
+        rcode: u8,
+        answers: &[Answer],
+        authorities: &[Answer],
+        age: u32,
+    ) -> Vec<u8> {
         let mut header = self.header;
         header.qr = 1;
         header.ra = 1;
+        header.aa = 0;
+        header.tc = 0;
+        header.rcode = rcode;
+        header.qdcount = self.questions.len() as u16;
         header.ancount = answers.len() as u16;
-        header.nscount = 0;
+        header.nscount = authorities.len() as u16;
         header.arcount = 0;
 
-        let mut buf = Vec::with_capacity(512);
+        let mut buf = Vec::with_capacity(DEFAULT_UDP_PAYLOAD);
         header.write_to(&mut buf);
         for q in &self.questions {
             q.write_to(&mut buf);
         }
-        for a in answers {
-            a.write_to(&mut buf);
+        for a in answers.iter().chain(authorities) {
+            a.write_to(&mut buf, age);
         }
         buf
     }
 
-    /// Reads a domain name starting at `start`, following compression
-    /// pointers, and returns the uncompressed name along with the number of
-    /// bytes consumed at the original position.
-    fn qname(buf: &[u8], start: usize) -> (Vec<u8>, usize) {
-        let mut name: Vec<u8> = Vec::new();
-        let mut n = start;
-        loop {
-            let Some(&b) = buf.get(n) else {
-                // Truncated packet: return what we have.
-                return (name, n - start);
-            };
-
-            // A pointer (two high bits set) ends the name; the remainder
-            // lives at the 14-bit offset it encodes.
-            if b & 0b1100_0000 == 0b1100_0000 {
-                let Some(&low) = buf.get(n + 1) else {
-                    return (name, n - start);
-                };
-                let target = ((b as u16 & 0x3f) << 8 | low as u16) as usize;
-                let (suffix, _) = Self::qname(buf, target);
-                name.extend_from_slice(&suffix);
-                // The pointer itself occupies two bytes.
-                return (name, n + 2 - start);
-            }
-
-            if b == 0 {
-                name.push(b);
-                return (name, n + 1 - start);
-            }
-
-            let len = b as usize;
-            if n + 1 + len > buf.len() {
-                // Truncated label: return what we have.
-                return (name, n - start);
-            }
-            name.push(b);
-            name.extend_from_slice(&buf[n + 1..n + 1 + len]);
-            n += 1 + len;
-        }
+    /// Serializes an empty response to this query with TC set and the
+    /// given RCODE, for when the full response is larger than the client
+    /// can receive (RFC 2181 §9).
+    pub fn truncated_bytes(&self, rcode: u8) -> Vec<u8> {
+        let mut buf = self.response_bytes(rcode, &[], &[], 0);
+        buf[2] |= 0x02;
+        buf
     }
 
-    fn parse_questions(buf: &[u8], mut offset: usize, count: u16) -> (Vec<Question>, usize) {
-        let mut questions = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            let (name, advance) = Self::qname(buf, offset);
-            offset += advance;
-            // Need 4 bytes for type + class; bail on a truncated packet.
-            if offset + 4 > buf.len() {
-                break;
-            }
-            questions.push(Question {
-                name,
-                tp: u16::from_be_bytes([buf[offset], buf[offset + 1]]),
-                class: u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]),
-            });
-            offset += 4;
-        }
-        (questions, offset)
+    /// The largest UDP response this query's sender can receive: the
+    /// payload size in its EDNS OPT record (RFC 6891 §6.2.3), or 512.
+    pub fn udp_payload_limit(&self) -> usize {
+        self.resources
+            .iter()
+            .find(|r| r.tp == TYPE_OPT)
+            .map_or(DEFAULT_UDP_PAYLOAD, |opt| opt.class as usize)
+            .clamp(DEFAULT_UDP_PAYLOAD, MAX_UDP_PAYLOAD)
     }
+}
 
-    fn parse_answers(buf: &[u8], mut offset: usize, count: u16) -> (Vec<Answer>, usize) {
-        let mut answers = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            let (name, advance) = Self::qname(buf, offset);
-            offset += advance;
-            // Need 10 bytes for type + class + ttl + rdlength; bail on a
-            // truncated packet.
-            if offset + 10 > buf.len() {
-                break;
-            }
-            let tp = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
-            let class = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]);
-            let ttl = u32::from_be_bytes([
-                buf[offset + 4],
-                buf[offset + 5],
-                buf[offset + 6],
-                buf[offset + 7],
-            ]);
-            let length = u16::from_be_bytes([buf[offset + 8], buf[offset + 9]]);
-            offset += 10;
-
-            // The record data must fit within the buffer.
-            if offset + length as usize > buf.len() {
-                break;
-            }
-
-            // Record types whose RDATA contains a domain name must be
-            // decompressed so cached copies don't carry pointers into a
-            // packet that no longer exists.
-            let data = match tp {
-                TYPE_NS | TYPE_CNAME | TYPE_PTR => {
-                    let (decompressed, _) = Self::qname(buf, offset);
-                    decompressed
-                }
-                TYPE_MX if length >= 2 => {
-                    // MX: 2-byte preference followed by a domain name.
-                    let mut mx_data = buf[offset..offset + 2].to_vec();
-                    let (decompressed, _) = Self::qname(buf, offset + 2);
-                    mx_data.extend_from_slice(&decompressed);
-                    mx_data
-                }
-                _ => buf[offset..offset + length as usize].to_vec(),
-            };
-
-            offset += length as usize;
-
-            answers.push(Answer {
-                name,
-                tp,
-                class,
-                ttl,
-                length: data.len() as u16,
-                data,
-            });
-        }
-        (answers, offset)
-    }
+/// Overwrites the transaction ID of the raw message in `buf`.
+pub fn set_id(buf: &mut [u8], id: u16) {
+    buf[..2].copy_from_slice(&id.to_be_bytes());
 }
 
 #[cfg(test)]

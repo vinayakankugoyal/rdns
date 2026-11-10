@@ -32,13 +32,17 @@ impl DNSBlocklist {
 
     /// Replaces the current set of domains with `domains`.
     #[cfg(test)]
-    fn replace(&self, domains: HashSet<String>) {
+    pub(crate) fn replace(&self, domains: HashSet<String>) {
         *self.store.write().unwrap() = domains;
     }
 
     /// Returns whether `domain` (dotted presentation form) is blocked.
+    /// Matching ignores ASCII case, as DNS does (RFC 4343).
     pub fn contains(&self, domain: &str) -> bool {
-        self.store.read().unwrap().contains(domain)
+        self.store
+            .read()
+            .unwrap()
+            .contains(&domain.to_ascii_lowercase())
     }
 
     /// Returns the number of blocked domains.
@@ -47,7 +51,7 @@ impl DNSBlocklist {
     }
 }
 
-/// Extracts the blocked domains from a hosts-format file body.
+/// Extracts the blocked domains from a hosts-format file body, lowercased.
 fn parse_hosts(body: &str) -> HashSet<String> {
     body.lines()
         .map(str::trim)
@@ -56,7 +60,7 @@ fn parse_hosts(body: &str) -> HashSet<String> {
             // Hosts file format: `0.0.0.0 domain.com`
             let mut parts = line.split_whitespace();
             match (parts.next(), parts.next()) {
-                (Some("0.0.0.0"), Some(domain)) => Some(domain.to_string()),
+                (Some("0.0.0.0"), Some(domain)) => Some(domain.to_ascii_lowercase()),
                 _ => None,
             }
         })

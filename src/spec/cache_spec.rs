@@ -1,90 +1,201 @@
-//! Executable specification of the response cache (see `spec/SPEC.md`).
+//! Executable specification of the response cache (see `docs/SPEC.md`).
 
 use super::*;
 
-fn answer(ttl: u32) -> Answer {
-    Answer {
-        name: vec![
-            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
-        ],
-        tp: 1,
-        class: 1,
-        ttl,
-        length: 4,
-        data: vec![1, 2, 3, 4],
+const NXDOMAIN_FLAGS: u16 = 0x8183;
+const NOERROR_FLAGS: u16 = 0x8180;
+
+fn wire(name: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for label in name.split('.').filter(|l| !l.is_empty()) {
+        out.push(label.len() as u8);
+        out.extend_from_slice(label.as_bytes());
     }
+    out.push(0);
+    out
 }
 
-fn question() -> Question {
+/// A response for `name` with `flags`, A records with the given TTLs, and
+/// optionally an SOA (with that TTL and MINIMUM) in the authority section.
+fn response(name: &str, flags: u16, ttls: &[u32], soa: Option<(u32, u32)>) -> DNSPacket {
+    let mut m = Vec::new();
+    for v in [0x1234, flags, 1, ttls.len() as u16, soa.is_some() as u16, 0] {
+        m.extend(u16::to_be_bytes(v));
+    }
+    m.extend(wire(name));
+    m.extend([0, 1, 0, 1]);
+    for ttl in ttls {
+        m.extend([0xC0, 12, 0, 1, 0, 1]);
+        m.extend(ttl.to_be_bytes());
+        m.extend([0, 4, 1, 2, 3, 4]);
+    }
+    if let Some((ttl, minimum)) = soa {
+        m.extend([0xC0, 12, 0, 6, 0, 1]);
+        m.extend(ttl.to_be_bytes());
+        m.extend([0, 22, 0, 0]); // RDLENGTH 22: MNAME ".", RNAME "."
+        m.extend([0; 16]);
+        m.extend(minimum.to_be_bytes());
+    }
+    DNSPacket::from_bytes(&m).expect("test response must be well formed")
+}
+
+fn question(name: &str) -> Question {
     Question {
-        name: answer(0).name,
+        name: wire(name),
         tp: 1,
         class: 1,
     }
 }
 
-/// C1. get(insert(q, a)) = a while the entry is live.          holds
+/// C1. get(insert(q, r)) replays r's answers while the entry is live.
 #[test]
 fn c1_insert_then_get() {
-    let c = DNSCache::new();
-    c.insert(question(), vec![answer(600)]);
-    let got = c.get(&question()).unwrap();
-    assert_eq!(got.len(), 1);
-    assert_eq!(got[0].data, [1, 2, 3, 4]);
+    let c = DNSCache::new(0);
+    assert!(c.insert(
+        question("example.com"),
+        response("example.com", NOERROR_FLAGS, &[600], None)
+    ));
+    let hit = c.get(&question("example.com")).unwrap();
+    assert_eq!(hit.response.rcode, RCODE_NOERROR);
+    assert_eq!(hit.response.answers[0].data, [1, 2, 3, 4]);
 }
 
-/// C2. cleanup(now) removes exactly the entries with expiration ≤ now. holds
+/// C2. cleanup(now) removes exactly the entries with expiration ≤ now.
 #[test]
 fn c2_cleanup_removes_only_expired() {
-    let c = DNSCache::new();
-    c.insert(question(), vec![answer(600)]);
-    c.cleanup(Instant::now());
-    assert!(c.get(&question()).is_some());
-    c.cleanup(Instant::now() + Duration::from_secs(601));
-    assert!(c.store.read().unwrap().is_empty());
-}
-
-/// C3. A record served from the cache never claims to be valid for longer
-/// than the cache will keep it: served TTL ≤ remaining lifetime.
-///
-/// Fails: `get` hands back the TTL the record arrived with. After 599 s of
-/// a 600 s entry, a client is still told "cache this for 600 s", so
-/// downstream caches hold the record up to twice as long as the authority
-/// allowed (and indefinitely longer across chained caches).
-#[test]
-#[ignore = "bug: cached answers are served with their original, undecremented TTL"]
-fn c3_counterexample_served_ttl_not_decremented() {
-    let c = DNSCache::new();
-    c.insert(question(), vec![answer(600)]);
-    // Fast-forward: the entry has 1 second left to live.
-    let deadline = Instant::now() + Duration::from_secs(1);
-    c.store
-        .write()
-        .unwrap()
-        .get_mut(&question())
-        .unwrap()
-        .expiration = deadline;
-
-    let served = c.get(&question()).unwrap();
-    let remaining = deadline.saturating_duration_since(Instant::now()).as_secs();
-    assert!(
-        served[0].ttl as u64 <= remaining,
-        "served ttl {} > remaining lifetime {remaining}s",
-        served[0].ttl
+    let c = DNSCache::new(0);
+    let t0 = Instant::now();
+    c.insert_at(
+        question("a.test"),
+        response("a.test", NOERROR_FLAGS, &[60], None),
+        t0,
     );
+    c.insert_at(
+        question("b.test"),
+        response("b.test", NOERROR_FLAGS, &[600], None),
+        t0,
+    );
+    c.cleanup(t0 + Duration::from_secs(60));
+    let store = c.store.read().unwrap();
+    assert!(!store.contains_key(&question("a.test")));
+    assert!(store.contains_key(&question("b.test")));
 }
 
-/// C4. A TTL-0 record is not served from the cache (RFC 1035 §3.2.1:
-/// "zero values are interpreted to mean that the RR can only be used for
-/// the transaction in progress, and should not be cached").
-///
-/// Fails by design today (MIN_CACHE_TTL clamps every entry to ≥ 300 s);
-/// recorded so the decision is explicit. Combined with C3 the client is
-/// also told TTL 0 while getting a 5-minute-old answer.
+/// C3. Served TTL ≤ remaining lifetime of the entry, for every age and
+/// every minimum TTL setting. Regression for #13.
 #[test]
-#[ignore = "bug: TTL-0 / short-TTL records are cached for at least 300s"]
-fn c4_counterexample_ttl_zero_is_cached() {
-    let c = DNSCache::new();
-    c.insert(question(), vec![answer(0)]);
-    assert!(c.get(&question()).is_none());
+fn c3_served_ttl_never_exceeds_remaining_lifetime_exhaustive() {
+    for min_ttl in [0, 300, 1000] {
+        let c = DNSCache::new(min_ttl);
+        let t0 = Instant::now();
+        c.insert_at(
+            question("example.com"),
+            response("example.com", NOERROR_FLAGS, &[600], None),
+            t0,
+        );
+        let lifetime = Duration::from_secs(600u64.max(min_ttl.into()));
+        for ms in (0..=1_100_000).step_by(250) {
+            let now = t0 + Duration::from_millis(ms);
+            let hit = c.get_at(&question("example.com"), now);
+            assert_eq!(
+                hit.is_some(),
+                now < t0 + lifetime,
+                "min_ttl={min_ttl} t={ms}ms"
+            );
+            if let Some(hit) = hit {
+                let served = hit.response.answers[0].ttl.saturating_sub(hit.age);
+                let remaining = (t0 + lifetime).duration_since(now).as_secs_f64();
+                assert!(
+                    f64::from(served) <= remaining,
+                    "min_ttl={min_ttl} t={ms}ms: served {served} > remaining {remaining}"
+                );
+            }
+        }
+    }
+}
+
+/// C4. The cache-lifetime policy (RFC 1035 §3.2.1, RFC 2308). Regression
+/// for #11, #12 and #13.
+#[test]
+fn c4_cache_ttl_policy() {
+    let ok = NOERROR_FLAGS;
+    let cases: &[(&str, DNSPacket, Option<u32>)] = &[
+        (
+            "answers: min TTL",
+            response("x.test", ok, &[600, 60, 300], None),
+            Some(60),
+        ),
+        (
+            "TTL 0 is not cached",
+            response("x.test", ok, &[0], None),
+            None,
+        ),
+        (
+            "one TTL 0 is enough",
+            response("x.test", ok, &[600, 0], None),
+            None,
+        ),
+        (
+            "TC is not cached",
+            response("x.test", 0x8380, &[600], None),
+            None,
+        ),
+        (
+            "SERVFAIL is not cached",
+            response("x.test", 0x8182, &[], None),
+            None,
+        ),
+        (
+            "REFUSED is not cached",
+            response("x.test", 0x8185, &[], None),
+            None,
+        ),
+        (
+            "NXDOMAIN: min(SOA TTL, MINIMUM)",
+            response("x.test", NXDOMAIN_FLAGS, &[], Some((3600, 900))),
+            Some(900),
+        ),
+        (
+            "NODATA: min(SOA TTL, MINIMUM)",
+            response("x.test", ok, &[], Some((120, 900))),
+            Some(120),
+        ),
+        (
+            "NXDOMAIN without SOA",
+            response("x.test", NXDOMAIN_FLAGS, &[], None),
+            None,
+        ),
+        (
+            "NODATA without SOA",
+            response("x.test", ok, &[], None),
+            None,
+        ),
+    ];
+    for (what, packet, want) in cases {
+        assert_eq!(cache_ttl(packet), *want, "{what}");
+    }
+}
+
+/// C5. A negative entry replays its RCODE and SOA. Regression for #11.
+#[test]
+fn c5_negative_entries_keep_rcode_and_soa() {
+    let c = DNSCache::new(0);
+    let r = response("nope.test", NXDOMAIN_FLAGS, &[], Some((3600, 900)));
+    assert!(c.insert(question("nope.test"), r));
+    let hit = c.get(&question("nope.test")).unwrap();
+    assert_eq!(hit.response.rcode, RCODE_NXDOMAIN);
+    assert_eq!(hit.response.authorities.len(), 1);
+    assert_eq!(hit.response.authorities[0].soa_minimum(), Some(900));
+}
+
+/// C6. Lookups ignore the case of the name. Regression for #8.
+#[test]
+fn c6_lookups_ignore_case() {
+    let c = DNSCache::new(0);
+    c.insert(
+        question("Example.COM"),
+        response("Example.COM", NOERROR_FLAGS, &[600], None),
+    );
+    assert!(c.get(&question("example.com")).is_some());
+    assert!(c.get(&question("EXAMPLE.com")).is_some());
 }

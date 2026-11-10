@@ -10,11 +10,12 @@ It's like a bouncer for your internet traffic, but written in Rust so it's *memo
 
 ## Features ✨
 
-*   **Caching that actually works:** We remember where `google.com` is so you don't have to ask every 5 milliseconds.
+*   **Caching that actually works:** We remember where `google.com` is so you don't have to ask every 5 milliseconds. TTLs count down honestly, and NXDOMAIN stays NXDOMAIN.
 *   **Blocklisting:** We download a list of "bad" domains and pretend they don't exist. It's not censorship, it's *curated browsing*.
 *   **Metrics:** We expose Prometheus metrics because if you can't graph your DNS latency, are you even an engineer?
 *   **TUI (Terminal User Interface):** Look like a hacker from a 90s movie while monitoring your DNS traffic. Matrix rain not included (yet).
 *   **Written in Rust:** So you can tell your friends you're running "blazingly fast" software.
+*   **A written spec:** What rdns guarantees is [written down](docs/SPEC.md) and checked by the test suite. See below.
 
 ## Usage 🚀
 
@@ -36,6 +37,12 @@ It's like a bouncer for your internet traffic, but written in Rust so it's *memo
     ./target/release/rdns --port 5353 --resolver 8.8.8.8:53
     ```
 
+    **Caching harder than the TTL says:**
+    Keep cache entries for at least N seconds, even if a record's TTL is shorter. Records still count down to TTL 0, so your devices won't hang on to them any longer.
+    ```bash
+    ./target/release/rdns --min-cache-ttl 300
+    ```
+
     **Headless Mode:**
     Don't need the fancy TUI? Run it in headless mode:
     ```bash
@@ -45,6 +52,22 @@ It's like a bouncer for your internet traffic, but written in Rust so it's *memo
 3.  **Point your DNS to it:**
     Change your computer's DNS settings to `127.0.0.1`.
     *Warning: If you break your internet, don't call us. We're probably debugging a borrow checker error.*
+
+## The spec 📐
+
+[`docs/SPEC.md`](docs/SPEC.md) defines what rdns promises. For example, the parser
+finishes on *every* input, a reply only counts if it answers the question
+that was actually asked, and a cached record never claims more TTL than it
+has left. Each promise is a property checked by `cargo test`: exhaustively
+where the inputs are small enough, otherwise with a fixed-seed generator.
+
+Writing the spec found [eleven bugs](docs/SPEC.md#bugs-this-spec-found) in
+rdns 0.1.0, among them a one-packet crash and a cache-poisoning weakness.
+It's the reason they're fixed and the reason they stay fixed.
+
+```bash
+cargo test    # check every property
+```
 
 ## Nix ❄️
 

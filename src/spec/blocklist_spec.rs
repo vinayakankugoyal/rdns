@@ -1,10 +1,10 @@
 //! Executable specification of blocklist parsing and matching
-//! (see `spec/SPEC.md`).
+//! (see `docs/SPEC.md`).
 
 use super::*;
 
 /// L1. parse_hosts keeps exactly the `0.0.0.0 <domain>` entries and
-/// ignores comments, blanks and other addresses.                 holds
+/// ignores comments, blanks and other addresses.
 #[test]
 fn l1_parse_hosts() {
     let body = "# comment\n\n127.0.0.1 localhost\n0.0.0.0 ads.example.com\n\
@@ -20,14 +20,15 @@ fn l1_parse_hosts() {
 /// ASCII case are the same name (RFC 1035 §2.3.3, RFC 4343), so
 /// contains(n) = contains(lowercase(n)).
 ///
-/// Fails: the lookup is an exact `HashSet<String>` match, so `ADS.example.com`
-/// (or any 0x20-randomized spelling, which some stub resolvers send by
-/// default) sails past the blocklist.
+/// Regression for #8: covers mixed-case queries, including DNS 0x20
+/// randomized spellings, and mixed-case entries in the hosts file.
 #[test]
-#[ignore = "bug: blocklist matching is case-sensitive (trivial bypass)"]
-fn l2_counterexample_case_bypass() {
+fn l2_matching_ignores_case() {
     let bl = DNSBlocklist::new();
-    bl.replace(parse_hosts("0.0.0.0 ads.example.com\n"));
+    bl.replace(parse_hosts(
+        "0.0.0.0 ads.example.com\n0.0.0.0 Tracker.Example.NET\n",
+    ));
+    assert!(bl.contains("tracker.example.net"));
     assert!(bl.contains("ads.example.com"));
     for spelling in ["ADS.EXAMPLE.COM", "Ads.Example.Com", "aDs.eXaMpLe.cOm"] {
         assert!(bl.contains(spelling), "{spelling} not blocked");

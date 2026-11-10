@@ -10,6 +10,7 @@ chrono = "0.4.43"
 clap = { version = "4.5.54", features = ["derive"] }
 crossterm = "0.29.0"
 prometheus = "0.13"
+rand = "0.9"
 ratatui = "0.30.0"
 reqwest = { version = "0.13", features = ["json"] }
 sysinfo = "0.38.0"

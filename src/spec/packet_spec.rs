@@ -1,10 +1,8 @@
-//! Executable specification of the DNS wire codec (see `spec/SPEC.md`).
+//! Executable specification of the DNS wire codec (see `docs/SPEC.md`).
 //!
-//! Each `#[test]` checks one property from the spec. Properties checked
-//! over their whole input domain say "exhaustive"; the rest use a seeded
-//! generator ("bounded"). A property the code currently violates is marked
-//! `#[ignore]` with the issue that tracks it, so `cargo test` stays green
-//! and `cargo test -- --ignored` reproduces every open counterexample.
+//! Each test checks one property from the spec. A test whose name ends in
+//! `_exhaustive` covers the property's whole input domain; the others use a
+//! seeded generator ("bounded"), so every run checks the same cases.
 
 use super::*;
 
@@ -57,15 +55,6 @@ fn query(name: &str, tp: u16) -> Vec<u8> {
     p
 }
 
-/// Wire-format RDATA length each record type must have, where fixed.
-fn fixed_rdlength(tp: u16) -> Option<usize> {
-    match tp {
-        1 => Some(4),   // A
-        28 => Some(16), // AAAA
-        _ => None,
-    }
-}
-
 /// Spec predicate WF(name): a domain name in uncompressed wire format is a
 /// sequence of labels of length 1..=63 terminated by the root label, at
 /// most 255 bytes in total (RFC 1035 §3.1, §2.3.4).
@@ -84,9 +73,9 @@ fn well_formed_name(name: &[u8]) -> bool {
     false
 }
 
-/// Resolves a (possibly compressed) name at `off` in `buf` the way RFC 1035
-/// §4.1.4 defines it, rejecting loops. This is the reference the parser is
-/// compared against.
+/// Reference decoder: the name at `off` as RFC 1035 §4.1.4 defines it,
+/// with loops cut off by a hop limit. The parser must agree with it on
+/// every name it accepts.
 fn reference_name(buf: &[u8], mut off: usize) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let mut hops = 0;
@@ -98,6 +87,8 @@ fn reference_name(buf: &[u8], mut off: usize) -> Option<Vec<u8>> {
                 return None;
             }
             off = ((b as usize & 0x3F) << 8) | *buf.get(off + 1)? as usize;
+        } else if b & 0xC0 != 0 {
+            return None;
         } else if b == 0 {
             out.push(0);
             return Some(out);
@@ -110,9 +101,9 @@ fn reference_name(buf: &[u8], mut off: usize) -> Option<Vec<u8>> {
 }
 
 /// Re-runs the test named `child` in a fresh process and reports whether
-/// it exited normally. Stack overflow aborts the whole process rather than
-/// panicking, so non-termination of the parser can only be observed from
-/// outside.
+/// it exited normally. Rust aborts the whole process on stack overflow
+/// instead of panicking, so a regression to unbounded recursion can only be
+/// observed cleanly from outside.
 fn child_exits_cleanly(child: &str) -> bool {
     std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", child, "--nocapture", "--test-threads=1"])
@@ -124,16 +115,14 @@ fn child_exits_cleanly(child: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// H1. Header codec is a bijection on 12-byte strings.   STATUS: holds
+// H1. The header codec is a bijection on 12-byte strings.
 // ---------------------------------------------------------------------------
 
-/// ∀ b ∈ Byte¹², write(read(b)) = b.
-///
-/// The only bytes the codec transforms are the two flag bytes (2 and 3);
-/// the rest are copied as big-endian u16s. We check every value of the
-/// flag bytes exhaustively (2¹⁶ cases) against random values for the rest.
+/// ∀ b ∈ Byte¹², write(read(b)) = b. The only bytes the codec transforms
+/// are the two flag bytes, so every value of those is checked (2¹⁶ cases),
+/// with random values for the rest.
 #[test]
-fn h1_header_roundtrip_exhaustive_over_flags() {
+fn h1_header_roundtrip_exhaustive() {
     let mut rng = Rng(0xD15EA5E);
     for flags in 0..=u16::MAX {
         let mut b = [0u8; HEADER_LEN];
@@ -151,222 +140,276 @@ fn h1_header_roundtrip_exhaustive_over_flags() {
 // P1. Parsing is total: from_bytes terminates on every input.
 // ---------------------------------------------------------------------------
 
-/// Bounded check over random inputs *without* compression pointers that
-/// loop. Holds: absent a pointer cycle, every step of `qname` advances.
+/// Bounded check over random inputs, compression pointers included.
 #[test]
-fn p1_parser_total_on_random_acyclic_inputs() {
+fn p1_parser_total_on_random_inputs() {
     let mut rng = Rng(42);
-    for _ in 0..20_000 {
+    for _ in 0..50_000 {
         let len = rng.below(80);
         let mut b: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
-        // Clear the pointer tag everywhere so no pointer can form a cycle.
-        for x in b.iter_mut().skip(HEADER_LEN) {
-            if *x & 0xC0 == 0xC0 {
-                *x &= 0x3F;
-            }
+        if b.len() >= HEADER_LEN {
+            // Keep counts small so the body gets parsed.
+            b[4] = 0;
+            b[5] = rng.byte() % 4;
+            b[6] = 0;
+            b[7] = rng.byte() % 4;
         }
         let _ = DNSPacket::from_bytes(&b);
     }
 }
 
-/// Counterexample: a 14-byte query whose name is a pointer to itself.
-/// `qname` follows it forever and overflows the stack, which aborts the
-/// whole process. Any client that can reach the port can send this.
+/// Regression for #3: names whose pointers form a cycle, either a pointer
+/// to itself or a label followed by a pointer back to that label. Run in a
+/// child process so a regression fails the test instead of aborting the
+/// test harness.
 #[test]
-#[ignore = "bug: compression-pointer loop overflows the stack (crashes the server)"]
-fn p1_counterexample_self_pointer() {
+fn p1_pointer_cycles_terminate() {
     assert!(
-        child_exits_cleanly("packet::spec::p1_child_parse_self_pointer"),
-        "parsing a self-referencing pointer aborted the process"
+        child_exits_cleanly("packet::spec::p1_child_parse_pointer_cycles"),
+        "parsing a compression-pointer cycle aborted the process"
     );
 }
 
-/// Body of the counterexample above; a no-op unless run as its child.
+/// Body of the test above; a no-op unless run as its child.
 #[test]
-fn p1_child_parse_self_pointer() {
+fn p1_child_parse_pointer_cycles() {
     if std::env::var_os("RDNS_SPEC_CHILD").is_none() {
         return;
     }
-    let mut pkt = header(1, 0x0100, 1, 0, 0, 0);
-    pkt.extend([0xC0, 0x0C]); // pointer to offset 12, i.e. to itself
-    let _ = DNSPacket::from_bytes(&pkt);
-}
-
-// ---------------------------------------------------------------------------
-// P2. Parsed names are well formed: WF(q.name) for every parsed question.
-// ---------------------------------------------------------------------------
-
-/// Holds for names that are actually complete in the buffer.
-#[test]
-fn p2_complete_names_are_well_formed() {
-    for name in ["a", "example.com", "x.y.z.w", "localhost"] {
-        let p = DNSPacket::from_bytes(&query(name, 1)).unwrap();
-        assert!(well_formed_name(&p.questions[0].name));
-        assert_eq!(p.questions[0].name, wire(name));
+    let cycles: [&[u8]; 3] = [
+        &[0xC0, 0x0C],                // pointer to itself
+        &[1, b'a', 0xC0, 0x0C],       // label, then pointer back to it
+        &[0xC0, 0x0E, 0xC0, 0x0C, 0], // two pointers pointing at each other
+    ];
+    for name in cycles {
+        let mut pkt = header(1, 0x0100, 1, 0, 0, 0);
+        pkt.extend(name);
+        pkt.extend([0, 1, 0, 1]);
+        assert!(DNSPacket::from_bytes(&pkt).is_none());
     }
 }
 
-/// Bounded check: whenever the parser returns a question, its name agrees
-/// with the RFC 1035 reference resolver (and so is terminated by the root
-/// label). Fails: when the name is truncated or a pointer target is out of
-/// range, `qname` returns a prefix with no terminator and the parser goes
-/// on to read TYPE/CLASS from whatever bytes follow.
+// ---------------------------------------------------------------------------
+// P2. Soundness: every name the parser accepts is well formed and equals
+//     the reference decoding.
+// ---------------------------------------------------------------------------
+
 #[test]
-#[ignore = "bug: truncated / dangling names are accepted as questions"]
-fn p2_parsed_names_match_reference() {
+fn p2_parsed_names_are_sound() {
     let mut rng = Rng(7);
-    for _ in 0..50_000 {
+    for _ in 0..200_000 {
         let mut b = header(1, 0x0100, 1, 0, 0, 0);
         let len = rng.below(24);
-        b.extend((0..len).map(|_| rng.byte() & 0x3F | (rng.byte() & 0x80)));
-        // Drop cycles: they are P1's business.
-        if (HEADER_LEN..b.len()).any(|i| b[i] & 0xC0 == 0xC0) {
-            continue;
-        }
+        b.extend((0..len).map(|_| match rng.below(4) {
+            0 => 0xC0 | rng.byte() & 0x01,
+            1 => rng.byte(),
+            _ => rng.byte() % 8,
+        }));
         let Some(p) = DNSPacket::from_bytes(&b) else {
             continue;
         };
-        for q in &p.questions {
-            assert_eq!(
-                Some(q.name.clone()),
-                reference_name(&b, HEADER_LEN),
-                "input={b:02x?}"
-            );
+        let q = &p.questions[0];
+        assert!(well_formed_name(&q.name), "input={b:02x?}");
+        assert_eq!(
+            Some(q.name.clone()),
+            reference_name(&b, HEADER_LEN),
+            "input={b:02x?}"
+        );
+    }
+}
+
+/// Regression for #4: a label that runs past the end of the message, and a
+/// pointer past the end, are rejected rather than decoded partially.
+#[test]
+fn p2_truncated_names_rejected() {
+    for body in [&[5, b'a', b'b', b'c', b'd'][..], &[0xC0, 0xFF, 0, 1, 0, 1]] {
+        let mut b = header(1, 0x0100, 1, 0, 0, 0);
+        b.extend(body);
+        assert!(DNSPacket::from_bytes(&b).is_none(), "accepted {b:02x?}");
+    }
+}
+
+/// Names longer than 255 bytes are rejected.
+#[test]
+fn p2_overlong_names_rejected() {
+    let mut b = header(1, 0x0100, 1, 0, 0, 0);
+    // 4 labels of 63 bytes = 256 bytes before the root.
+    for _ in 0..4 {
+        b.push(63);
+        b.extend([b'a'; 63]);
+    }
+    b.extend([0, 0, 1, 0, 1]);
+    assert!(DNSPacket::from_bytes(&b).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// P3. Completeness: every well-formed, backward-compressed message parses,
+//     and its names decode to what was encoded.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn p3_well_formed_messages_parse() {
+    let mut rng = Rng(11);
+    for _ in 0..5_000 {
+        // Random names over a tiny alphabet, so suffixes repeat and get
+        // compressed.
+        let names: Vec<String> = (0..1 + rng.below(4))
+            .map(|_| {
+                (0..1 + rng.below(4))
+                    .map(|_| ["a", "bb", "ccc", "example", "com"][rng.below(5)])
+                    .collect::<Vec<_>>()
+                    .join(".")
+            })
+            .collect();
+        let mut m = header(1, 0x8180, names.len() as u16, 0, 0, 0);
+        let mut seen: Vec<(String, usize)> = Vec::new();
+        for name in &names {
+            // Compress against the longest suffix written so far.
+            let labels: Vec<&str> = name.split('.').collect();
+            let mut i = 0;
+            while i < labels.len() {
+                let suffix = labels[i..].join(".");
+                if let Some((_, off)) = seen.iter().find(|(s, _)| *s == suffix) {
+                    m.extend([0xC0 | (off >> 8) as u8, *off as u8]);
+                    break;
+                }
+                seen.push((suffix, m.len()));
+                m.push(labels[i].len() as u8);
+                m.extend(labels[i].as_bytes());
+                i += 1;
+            }
+            if i == labels.len() {
+                m.push(0);
+            }
+            m.extend([0, 1, 0, 1]);
+        }
+        let p = DNSPacket::from_bytes(&m).unwrap_or_else(|| panic!("rejected {m:02x?}"));
+        for (q, name) in p.questions.iter().zip(&names) {
+            assert_eq!(q.name, wire(name));
         }
     }
 }
 
-/// A concrete witness for the above: the label says 5 bytes follow but the
-/// packet ends after 4 more. The parser reports a question with an empty,
-/// unterminated name and type/class taken from the label's bytes.
-#[test]
-#[ignore = "bug: truncated / dangling names are accepted as questions"]
-fn p2_counterexample_truncated_label() {
-    let mut b = header(1, 0x0100, 1, 0, 0, 0);
-    b.extend([5, b'a', b'b', b'c', b'd']);
-    let p = DNSPacket::from_bytes(&b).unwrap();
-    assert!(
-        p.questions.iter().all(|q| well_formed_name(&q.name)),
-        "parsed {:?}",
-        p.questions
-    );
-}
-
 // ---------------------------------------------------------------------------
-// P3. Re-serialization is faithful: for a well-formed message m,
-//     parse(to_bytes(parse(m))) ≡ parse(m)   (records compared after
-//     decompression, against the reference resolver).
+// P4. Records are self-contained: RDATA that holds names is decompressed,
+//     so a record copied into a new message (as the cache does) decodes to
+//     the same thing.
 // ---------------------------------------------------------------------------
 
-/// Holds for messages whose only compressed names are owner names and
-/// NS/CNAME/PTR/MX RDATA — the types the parser decompresses.
+/// Regression for #5: an NXDOMAIN response whose SOA has an RNAME that
+/// points into its own MNAME.
 #[test]
-fn p3_roundtrip_with_decompressed_types() {
-    let mut m = header(9, 0x8180, 1, 2, 0, 0);
-    m.extend(wire("www.example.com"));
-    m.extend([0, 5, 0, 1]);
-    // CNAME www.example.com -> example.com (compressed, points at offset 16)
-    m.extend([0xC0, 12, 0, 5, 0, 1, 0, 0, 0, 60, 0, 2, 0xC0, 16]);
-    // A example.com 93.184.216.34
-    m.extend([0xC0, 16, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 93, 184, 216, 34]);
-
-    let p = DNSPacket::from_bytes(&m).unwrap();
-    let q = DNSPacket::from_bytes(&p.to_bytes()).unwrap();
-    assert_eq!(q.answers.len(), 2);
-    assert_eq!(q.answers[0].data, wire("example.com"));
-    assert_eq!(q.answers[1].name, wire("example.com"));
-    assert_eq!(q.answers[1].data, [93, 184, 216, 34]);
-}
-
-/// Counterexample: an NXDOMAIN response with an SOA in the authority
-/// section. SOA RDATA holds two compressed names but is copied verbatim,
-/// while the owner name before it is expanded from a 2-byte pointer to the
-/// full name. Every pointer in the SOA that targets bytes at or after the
-/// expanded name now lands in the wrong place.
-#[test]
-#[ignore = "bug: SOA (and other un-decompressed RDATA) pointers are corrupted on relay"]
-fn p3_counterexample_soa_pointers_shift() {
-    let mut m = header(9, 0x8183, 1, 0, 1, 0); // NXDOMAIN
-    m.extend(wire("nope.example.com")); // offset 12..30, "example.com" at 17
+fn p4_soa_rdata_is_self_contained() {
+    let mut m = header(9, 0x8183, 1, 0, 1, 0);
+    m.extend(wire("nope.example.com")); // "example.com" at offset 17
     m.extend([0, 1, 0, 1]);
-    // Authority: owner = pointer to "example.com" (offset 17).
-    let soa_rdata_start = m.len() + 12;
+    let rdata_start = m.len() + 12;
     m.extend([0xC0, 17, 0, 6, 0, 1, 0, 0, 0x0E, 0x10]);
-    let mut rdata = Vec::new();
-    rdata.extend([3, b'n', b's', b'1', 0xC0, 17]); // MNAME ns1.example.com
-    // RNAME hostmaster + pointer back into MNAME's suffix, i.e. a pointer
-    // into this very record (the common "compress against earlier RDATA").
-    rdata.extend([10]);
+    let mut rdata = vec![3, b'n', b's', b'1', 0xC0, 17]; // ns1.example.com
+    rdata.push(10);
     rdata.extend(b"hostmaster");
-    rdata.extend([0xC0, soa_rdata_start as u8 + 4]);
-    rdata.extend([0; 20]); // SERIAL..MINIMUM
+    rdata.extend([0xC0, rdata_start as u8 + 4]); // -> "example.com" via MNAME
+    rdata.extend([0; 20]);
     m.extend((rdata.len() as u16).to_be_bytes());
     m.extend(&rdata);
 
     let original = DNSPacket::from_bytes(&m).unwrap();
-    let relayed_bytes = original.to_bytes();
-    let relayed = DNSPacket::from_bytes(&relayed_bytes).unwrap();
-    let soa = &relayed.authorities[0];
-    let rdata_off = relayed_bytes.len() - soa.data.len();
-    let mname = reference_name(&relayed_bytes, rdata_off);
-    let rname = reference_name(&relayed_bytes, rdata_off + 6);
-    assert_eq!(mname, Some(wire("ns1.example.com")));
-    assert_eq!(rname, Some(wire("hostmaster.example.com")));
+    let mut want = wire("ns1.example.com");
+    want.extend(wire("hostmaster.example.com"));
+    want.extend([0; 20]);
+    assert_eq!(original.authorities[0].data, want);
+
+    // Copy the SOA into a brand-new message, as a cache hit does.
+    let q = DNSPacket::from_bytes(&query("nope.example.com", 1)).unwrap();
+    let copy = q.response_bytes(RCODE_NXDOMAIN, &[], &original.authorities, 0);
+    let copy = DNSPacket::from_bytes(&copy).unwrap();
+    assert_eq!(copy.authorities[0].data, want);
 }
 
-/// Header counts agree with section lengths after relay. Fails: when the
-/// parser stops early (truncated message, e.g. a >512-byte response cut by
-/// the receive buffer), `to_bytes` still writes the *original* counts.
+/// MX, SRV, CNAME: the name part is decompressed and fixed parts kept.
 #[test]
-#[ignore = "bug: relayed header counts can disagree with the records written"]
-fn p3_counterexample_counts_disagree_after_truncation() {
+fn p4_name_bearing_rdata_is_decompressed() {
+    let mut m = header(9, 0x8180, 1, 3, 0, 0);
+    m.extend(wire("example.com"));
+    m.extend([0, 15, 0, 1]);
+    m.extend([0xC0, 12, 0, 5, 0, 1, 0, 0, 0, 60, 0, 2, 0xC0, 12]); // CNAME
+    m.extend([0xC0, 12, 0, 15, 0, 1, 0, 0, 0, 60, 0, 7, 0, 10]); // MX 10
+    m.extend([2, b'm', b'x', 0xC0, 12]);
+    m.extend([0xC0, 12, 0, 33, 0, 1, 0, 0, 0, 60, 0, 8, 0, 1, 0, 2, 0, 53]); // SRV
+    m.extend([0xC0, 12]);
+    let p = DNSPacket::from_bytes(&m).unwrap();
+    assert_eq!(p.answers[0].data, wire("example.com"));
+    assert_eq!(
+        p.answers[1].data,
+        [&[0, 10][..], &wire("mx.example.com")].concat()
+    );
+    assert_eq!(
+        p.answers[2].data,
+        [&[0, 1, 0, 2, 0, 53][..], &wire("example.com")].concat()
+    );
+}
+
+/// RDATA whose fields don't exactly fill RDLENGTH is rejected.
+#[test]
+fn p4_rdata_length_mismatch_rejected() {
+    let mut m = header(9, 0x8180, 1, 1, 0, 0);
+    m.extend(wire("example.com"));
+    m.extend([0, 5, 0, 1]);
+    // CNAME claims 3 bytes of RDATA but holds a 2-byte pointer.
+    m.extend([0xC0, 12, 0, 5, 0, 1, 0, 0, 0, 60, 0, 3, 0xC0, 12, 0]);
+    assert!(DNSPacket::from_bytes(&m).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// P5. Truncated messages are rejected, not decoded partially.
+// ---------------------------------------------------------------------------
+
+/// Regression for #6: every proper prefix of a valid response is rejected.
+#[test]
+fn p5_truncated_sections_rejected_exhaustive() {
     let mut m = header(9, 0x8180, 1, 2, 0, 0);
     m.extend(wire("example.com"));
     m.extend([0, 1, 0, 1]);
     m.extend([0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4]);
-    m.extend([0xC0, 12, 0, 1, 0, 1, 0, 0]); // second record cut short
-
-    let p = DNSPacket::from_bytes(&m).unwrap();
-    assert_eq!(p.answers.len(), 1);
-    let out = p.to_bytes();
-    let ancount = u16::from_be_bytes([out[6], out[7]]) as usize;
-    assert_eq!(ancount, p.answers.len());
+    m.extend([0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 5, 6, 7, 8]);
+    assert!(DNSPacket::from_bytes(&m).is_some());
+    for cut in 0..m.len() {
+        assert!(
+            DNSPacket::from_bytes(&m[..cut]).is_none(),
+            "accepted a {cut}-byte prefix"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
-// B1. Synthesized blocked answers are well typed: if the RR type has a
-//     fixed RDATA size, rdlength equals it.
+// B1. Synthesized blocked answers are well typed.
 // ---------------------------------------------------------------------------
 
+/// Regression for #7: A gets 0.0.0.0, AAAA gets ::, and every other type
+/// gets no record (an empty NOERROR) instead of A-shaped data.
 #[test]
-fn b1_blocked_answer_for_a_is_well_typed() {
+fn b1_blocked_answers_are_well_typed_exhaustive() {
     let p = DNSPacket::from_bytes(&query("ads.example.com", 1)).unwrap();
-    let a = p.questions[0].to_blocked_answer();
-    assert_eq!(a.data.len(), 4);
-    assert_eq!(a.length as usize, a.data.len());
-}
-
-/// Counterexample: an AAAA (type 28) query for a blocked name gets an AAAA
-/// record carrying 4 bytes of RDATA. AAAA RDATA is 16 bytes (RFC 3596), so
-/// the response is malformed. MX, TXT, HTTPS, … get the same 4 zero bytes.
-#[test]
-#[ignore = "bug: blocked AAAA/MX/TXT/... queries get malformed 4-byte RDATA"]
-fn b1_counterexample_blocked_aaaa() {
-    for tp in [28u16, 15, 16, 65] {
-        let p = DNSPacket::from_bytes(&query("ads.example.com", tp)).unwrap();
-        let a = p.questions[0].to_blocked_answer();
-        if a.tp == tp {
-            match fixed_rdlength(tp) {
-                Some(n) => assert_eq!(a.data.len(), n, "type {tp}"),
-                None => panic!("type {tp}: answered with A-shaped RDATA {:?}", a.data),
-            }
+    for tp in 0..=u16::MAX {
+        let q = Question {
+            tp,
+            ..p.questions[0].clone()
+        };
+        match (tp, q.to_blocked_answer()) {
+            (TYPE_A, Some(a)) => assert_eq!(a.data, [0; 4]),
+            (TYPE_AAAA, Some(a)) => assert_eq!(a.data, [0; 16]),
+            (TYPE_A | TYPE_AAAA, None) => panic!("type {tp}: no answer"),
+            (_, None) => {}
+            (_, Some(a)) => panic!("type {tp}: {a:?}"),
         }
     }
 }
 
 // ---------------------------------------------------------------------------
 // R1. A synthesized response answers the query: same ID and question,
-//     QR=1, ANCOUNT = |answers|, NS/ARCOUNT = 0.          STATUS: holds
+//     QR=1, RCODE as given, counts equal to the records written.
+// R2. Served TTLs are aged: each TTL is reduced by `age`, saturating at 0.
+// R3. The truncated form is a TC=1 response with no records.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -378,13 +421,77 @@ fn r1_response_bytes_shape() {
         q[1] = rng.byte();
         let p = DNSPacket::from_bytes(&q).unwrap();
         let n = rng.below(5);
-        let answers: Vec<_> = (0..n).map(|_| p.questions[0].to_blocked_answer()).collect();
-        let r = DNSPacket::from_bytes(&p.response_bytes(&answers)).unwrap();
+        let rcode = rng.byte() & 0x0f;
+        let answers: Vec<_> = (0..n)
+            .map(|_| p.questions[0].to_blocked_answer().unwrap())
+            .collect();
+        let r = DNSPacket::from_bytes(&p.response_bytes(rcode, &answers, &[], 0)).unwrap();
         assert_eq!(r.header.packet_id, p.header.packet_id);
-        assert_eq!(r.header.qr, 1);
+        assert_eq!((r.header.qr, r.header.rcode, r.header.tc), (1, rcode, 0));
         assert_eq!(r.answers.len(), n);
         assert_eq!(r.header.ancount as usize, n);
         assert_eq!((r.header.nscount, r.header.arcount), (0, 0));
         assert_eq!(r.questions, p.questions);
     }
+}
+
+#[test]
+fn r2_ttls_are_aged() {
+    let p = DNSPacket::from_bytes(&query("example.com", 1)).unwrap();
+    let a = p.questions[0].to_blocked_answer().unwrap();
+    for age in (0..=700).chain([u32::MAX]) {
+        let bytes = p.response_bytes(0, std::slice::from_ref(&a), &[], age);
+        let r = DNSPacket::from_bytes(&bytes).unwrap();
+        assert_eq!(r.answers[0].ttl, a.ttl.saturating_sub(age));
+    }
+}
+
+#[test]
+fn r3_truncated_bytes_shape() {
+    let p = DNSPacket::from_bytes(&query("example.com", 1)).unwrap();
+    let r = DNSPacket::from_bytes(&p.truncated_bytes(RCODE_NOERROR)).unwrap();
+    assert_eq!((r.header.qr, r.header.tc), (1, 1));
+    assert!(r.answers.is_empty());
+    assert_eq!(r.questions, p.questions);
+}
+
+// ---------------------------------------------------------------------------
+// E1. The client's UDP size limit is its EDNS payload size, clamped to
+//     [512, 4096], or 512 without EDNS.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e1_udp_payload_limit() {
+    let plain = DNSPacket::from_bytes(&query("example.com", 1)).unwrap();
+    assert_eq!(plain.udp_payload_limit(), 512);
+    for (advertised, want) in [(0u16, 512), (1232, 1232), (4096, 4096), (65535, 4096)] {
+        let mut q = query("example.com", 1);
+        q[11] = 1; // ARCOUNT = 1
+        q.extend([0, 0, 41]); // root owner, type OPT
+        q.extend(advertised.to_be_bytes()); // CLASS = payload size
+        q.extend([0, 0, 0, 0, 0, 0]); // TTL, RDLENGTH = 0
+        let p = DNSPacket::from_bytes(&q).unwrap();
+        assert_eq!(p.udp_payload_limit(), want);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Q1. Question equality ignores ASCII case in the name (RFC 4343), and
+//     hashing agrees with equality.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn q1_question_equality_ignores_case() {
+    use std::collections::hash_map::DefaultHasher;
+    let hash = |q: &Question| {
+        let mut h = DefaultHasher::new();
+        q.hash(&mut h);
+        h.finish()
+    };
+    let a = DNSPacket::from_bytes(&query("Example.COM", 1)).unwrap();
+    let b = DNSPacket::from_bytes(&query("example.com", 1)).unwrap();
+    let c = DNSPacket::from_bytes(&query("example.com", 28)).unwrap();
+    assert_eq!(a.questions[0], b.questions[0]);
+    assert_eq!(hash(&a.questions[0]), hash(&b.questions[0]));
+    assert_ne!(b.questions[0], c.questions[0]);
 }
