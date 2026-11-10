@@ -140,10 +140,92 @@ def Question.toBytes (q : Question) : Bytes := q.name ++ toBe16 q.tp ++ toBe16 q
 /-- `ttl.saturating_sub(age)`. -/
 def satSub (a b : UInt32) : UInt32 := if a ≥ b then a - b else 0
 
-/-- `Answer::write_to(buf, age)`. `data.len() as u16` truncates. -/
-def Answer.toBytes (a : Answer) (age : UInt32) : Bytes :=
-  a.name ++ toBe16 a.tp ++ toBe16 a.cls ++ toBe32 (satSub a.ttl age)
-    ++ toBe16 (UInt16.ofNat a.data.size) ++ a.data
+/-! ### Name compression (`Compressor`)
+
+The compressor's `HashMap` from suffix to offset is an association list:
+Rust inserts a suffix only after looking it up and missing, so keys are
+unique and the first match is the only one. Loops are structural
+recursion on a fuel argument (each step consumes at least one byte, so
+`name.size + 1` is enough) so that the kernel can evaluate them. -/
+
+abbrev Suffixes := List (Bytes × Nat)
+
+def Suffixes.get? (c : Suffixes) (s : Bytes) : Option Nat := (c.find? (·.1 == s)).map (·.2)
+
+/-- The `while let` loop of `Compressor::write`, from label offset `i`. -/
+def writeNameFrom (name : Bytes) : Nat → Nat → Bytes → Suffixes → Bytes × Suffixes
+  | 0, _, buf, c => (buf, c)
+  | fuel + 1, i, buf, c =>
+    match name[i]? with
+    | none => (buf, c)
+    | some len =>
+      let stop := i + 1 + len.toNat
+      if len = 0 ∨ len.toNat > 63 ∨ stop > name.size then
+        (buf ++ name.extract i name.size, c)          -- the root, or not well formed
+      else
+        let suffix := name.extract i name.size
+        match c.get? suffix with
+        | some off => (buf ++ toBe16 (UInt16.ofNat (0xC000 ||| off)), c)
+        | none =>
+          let c := if buf.size < 0x4000 then (suffix, buf.size) :: c else c
+          writeNameFrom name fuel stop (buf ++ name.extract i stop) c
+
+/-- `Compressor::write`. -/
+def writeName (name : Bytes) (buf : Bytes) (c : Suffixes) : Bytes × Suffixes :=
+  writeNameFrom name (name.size + 1) 0 buf c
+
+/-- `compressible_rdata`: the RFC 1035 types. -/
+def compressibleRdata (tp : UInt16) : Bool :=
+  (2 ≤ tp.toNat ∧ tp.toNat ≤ 9) ∨ tp.toNat = 12 ∨ tp.toNat = 14 ∨ tp.toNat = 15
+
+/-- `name_len`. -/
+def nameLenFrom (b : Bytes) : Nat → Nat → Option Nat
+  | 0, _ => none
+  | fuel + 1, i =>
+    match b[i]? with
+    | none => none
+    | some len =>
+      if len.toNat > 63 then none
+      else
+        let i := i + 1 + len.toNat
+        if len = 0 then (if i ≤ b.size then some i else none) else nameLenFrom b fuel i
+
+def nameLen (b : Bytes) : Option Nat := nameLenFrom b (b.size + 1) 0
+
+/-- `rdata_fields`: the RDATA split into (is a name, bytes). -/
+def rdataFields (a : Answer) : Option (List (Bool × Bytes)) :=
+  if !compressibleRdata a.tp then none
+  else do
+    let layout ← rdataLayout a.tp
+    let rec go : List Field → Bytes → Option (List (Bool × Bytes))
+      | [], rest => if rest.isEmpty then some [] else none
+      | f :: fs, rest => do
+        let (isName, n) ← match f with
+          | .name => (nameLen rest).map (true, ·)
+          | .fixed n => some (false, n)
+        if n > rest.size then none
+        else
+          let tail ← go fs (rest.extract n rest.size)
+          pure ((isName, rest.extract 0 n) :: tail)
+    go layout a.data
+
+/-- `Question::write_to`. -/
+def Question.write (q : Question) (buf : Bytes) (c : Suffixes) : Bytes × Suffixes :=
+  let (buf, c) := writeName q.name buf c
+  (buf ++ toBe16 q.tp ++ toBe16 q.cls, c)
+
+/-- `Answer::write_to(buf, age, names)`. `as u16` truncates. -/
+def Answer.write (a : Answer) (age : UInt32) (buf : Bytes) (c : Suffixes) : Bytes × Suffixes :=
+  let (buf, c) := writeName a.name buf c
+  let buf := buf ++ toBe16 a.tp ++ toBe16 a.cls ++ toBe32 (satSub a.ttl age)
+  let lengthAt := buf.size
+  let buf := buf ++ #[0, 0]
+  let (buf, c) := match rdataFields a with
+    | some fields => fields.foldl (fun (acc : Bytes × Suffixes) (f : Bool × Bytes) =>
+        if f.1 then writeName f.2 acc.1 acc.2 else (acc.1 ++ f.2, acc.2)) (buf, c)
+    | none => (buf ++ a.data, c)
+  let len := toBe16 (UInt16.ofNat (buf.size - lengthAt - 2))
+  ((buf.set! lengthAt len[0]!).set! (lengthAt + 1) len[1]!, c)
 
 /-- The header `response_bytes` writes. Everything not listed is copied
 from the query header unchanged. -/
@@ -158,9 +240,10 @@ def responseHeader (q : Packet) (rcode : UInt8) (nAns nAuth : Nat) : Header :=
 /-- `DNSPacket::response_bytes`. -/
 def Packet.responseBytes (q : Packet) (rcode : UInt8) (answers authorities : Array Answer)
     (age : UInt32) : Bytes :=
-  (responseHeader q rcode answers.size authorities.size).toBytes
-    ++ (q.questions.foldl (fun acc x => acc ++ x.toBytes) #[])
-    ++ ((answers ++ authorities).foldl (fun acc a => acc ++ a.toBytes age) #[])
+  let acc := q.questions.foldl (fun (acc : Bytes × Suffixes) x => x.write acc.1 acc.2)
+    ((responseHeader q rcode answers.size authorities.size).toBytes, [])
+  ((answers ++ authorities).foldl (fun (acc : Bytes × Suffixes) a => a.write age acc.1 acc.2)
+    acc).1
 
 /-- `DNSPacket::truncated_bytes`: `buf[2] |= 0x02`. -/
 def Packet.truncatedBytes (q : Packet) (rcode : UInt8) : Bytes :=
@@ -330,12 +413,14 @@ kernel can't evaluate `readName`, which is defined by well-founded
 recursion. -/
 #guard Packet.fromBytes srvRaw == some srvParsed
 
-/-- **Counterexample (compression).** The upstream's response is 295 bytes
-and fits a 512-byte client; the cache hit rebuilt from the same records is
-825 bytes, so that client gets TC = 1 and no answers. -/
-theorem bug_cache_hit_loses_compression :
+/-- **The former counterexample (compression).** The upstream's response
+is 295 bytes and fits a 512-byte client. Before #17 the cache hit rebuilt
+from the same records was 825 bytes, so that client got TC = 1 and no
+answers; with compression it is 455 bytes (SRV targets stay uncompressed,
+RFC 2782) and fits. -/
+theorem cache_hit_fits_after_compression :
     srvRaw.size = 295 ∧
-    (srvParsed.responseBytes RCODE_NOERROR srvParsed.answers #[] 1).size = 825 := by
+    (srvParsed.responseBytes RCODE_NOERROR srvParsed.answers #[] 1).size = 455 := by
   decide +kernel
 
 end Rdns

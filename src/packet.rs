@@ -192,9 +192,17 @@ impl Answer {
         buf.extend_from_slice(&self.ttl.saturating_sub(age).to_be_bytes());
         let length_at = buf.len();
         buf.extend_from_slice(&[0, 0]);
-        if !(compressible_rdata(self.tp) && write_rdata_compressed(self, buf, names)) {
-            buf.truncate(length_at + 2);
-            buf.extend_from_slice(&self.data);
+        match rdata_fields(self) {
+            Some(fields) => {
+                for (is_name, bytes) in fields {
+                    if is_name {
+                        names.write(buf, bytes);
+                    } else {
+                        buf.extend_from_slice(bytes);
+                    }
+                }
+            }
+            None => buf.extend_from_slice(&self.data),
         }
         let length = (buf.len() - length_at - 2) as u16;
         buf[length_at..length_at + 2].copy_from_slice(&length.to_be_bytes());
@@ -258,32 +266,25 @@ fn compressible_rdata(tp: u16) -> bool {
     matches!(tp, 2..=9 | 12 | 14 | 15)
 }
 
-/// Writes `a`'s RDATA, which holds uncompressed names, following its
-/// layout and compressing the names. Returns false, leaving `buf` partly
-/// written, if the RDATA doesn't match the layout.
-fn write_rdata_compressed(a: &Answer, buf: &mut Vec<u8>, names: &mut Compressor) -> bool {
-    let Some(layout) = rdata_layout(a.tp) else {
-        return false;
-    };
+/// `a`'s RDATA split into its fields, each marked as a name or not, if
+/// its names may be compressed and the RDATA matches its layout. The split
+/// happens before anything is written, so a mismatch can't leave the
+/// compressor pointing into bytes that were never sent.
+fn rdata_fields(a: &Answer) -> Option<Vec<(bool, &[u8])>> {
+    if !compressible_rdata(a.tp) {
+        return None;
+    }
+    let mut fields = Vec::new();
     let mut rest = &a.data[..];
-    for field in layout {
-        let n = match field {
-            Field::Name => match name_len(rest) {
-                Some(n) => n,
-                None => return false,
-            },
-            Field::Fixed(n) => *n,
+    for field in rdata_layout(a.tp)? {
+        let (is_name, n) = match field {
+            Field::Name => (true, name_len(rest)?),
+            Field::Fixed(n) => (false, *n),
         };
-        let Some(chunk) = rest.get(..n) else {
-            return false;
-        };
-        match field {
-            Field::Name => names.write(buf, chunk),
-            Field::Fixed(_) => buf.extend_from_slice(chunk),
-        }
+        fields.push((is_name, rest.get(..n)?));
         rest = &rest[n..];
     }
-    rest.is_empty()
+    rest.is_empty().then_some(fields)
 }
 
 /// Length of the uncompressed name at the start of `b`, root label
