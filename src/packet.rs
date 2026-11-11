@@ -22,6 +22,10 @@ pub const RCODE_NOERROR: u8 = 0;
 pub const RCODE_SERVFAIL: u8 = 2;
 pub const RCODE_NXDOMAIN: u8 = 3;
 
+/// The CD (checking disabled) bit within `Header::z`, which holds the Z,
+/// AD and CD bits of byte 3 (RFC 4035 §3.2).
+pub const Z_CD: u8 = 0x01;
+
 /// Size of the fixed DNS header in bytes.
 const HEADER_LEN: usize = 12;
 
@@ -508,10 +512,13 @@ impl DNSPacket {
     /// Serializes a response to this query.
     ///
     /// The header is copied from the query with QR and RA set, the given
-    /// RCODE, and counts matching the records written. Every TTL is
-    /// reduced by `age` seconds, the time the records spent in the cache.
-    /// Names are compressed, so a response rebuilt from cached records is
-    /// no larger than the upstream's compressed original.
+    /// RCODE, and counts matching the records written. Of the query's Z, AD
+    /// and CD bits only CD is copied (RFC 4035 §3.2.2): rdns validates
+    /// nothing, so it must never claim AD (RFC 4035 §3.2.3), and Z must be
+    /// zero (RFC 1035 §4.1.1). Every TTL is reduced by `age` seconds, the
+    /// time the records spent in the cache. Names are compressed, so a
+    /// response rebuilt from cached records is no larger than the
+    /// upstream's compressed original.
     pub fn response_bytes(
         &self,
         rcode: u8,
@@ -524,6 +531,7 @@ impl DNSPacket {
         header.ra = 1;
         header.aa = 0;
         header.tc = 0;
+        header.z &= Z_CD;
         header.rcode = rcode;
         header.qdcount = self.questions.len() as u16;
         header.ancount = answers.len() as u16;

@@ -435,6 +435,31 @@ fn r1_response_bytes_shape() {
     }
 }
 
+/// R4. A synthesized response never claims AD and never sets Z, whatever
+/// the query's bits; CD is copied. `dig` sets AD in every query, so before
+/// the fix every cache hit claimed DNSSEC validation. Regression for #15.
+#[test]
+fn r4_synthesized_responses_never_claim_ad_exhaustive() {
+    for z in 0..8u8 {
+        let mut q = query("example.com", 1);
+        q[3] = z << 4; // Z, AD, CD
+        let p = DNSPacket::from_bytes(&q).unwrap();
+        let answers = [p.questions[0].to_blocked_answer().unwrap()];
+        for bytes in [
+            p.response_bytes(RCODE_NOERROR, &answers, &[], 0),
+            p.response_bytes(RCODE_SERVFAIL, &[], &[], 0),
+            p.truncated_bytes(RCODE_NOERROR),
+        ] {
+            assert_eq!(bytes[3] & 0x60, 0, "query z={z:03b}: Z or AD set");
+            assert_eq!(
+                bytes[3] & 0x10,
+                (z & 1) << 4,
+                "query z={z:03b}: CD not copied"
+            );
+        }
+    }
+}
+
 #[test]
 fn r2_ttls_are_aged() {
     let p = DNSPacket::from_bytes(&query("example.com", 1)).unwrap();
