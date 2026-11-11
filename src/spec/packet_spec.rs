@@ -481,6 +481,122 @@ fn r3_truncated_bytes_shape() {
 }
 
 // ---------------------------------------------------------------------------
+// R6. Responses rebuilt from records are compressed: they decode to exactly
+//     the records written, and are no larger than the upstream's compressed
+//     original. Regression for #17.
+// ---------------------------------------------------------------------------
+
+/// A random name over a tiny alphabet, so suffixes repeat.
+fn small_name(rng: &mut Rng) -> String {
+    (0..1 + rng.below(4))
+        .map(|_| ["a", "bb", "Ccc", "example", "com"][rng.below(5)])
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+#[test]
+fn r6_rebuilt_responses_roundtrip() {
+    let mut rng = Rng(17);
+    for _ in 0..5_000 {
+        let p = DNSPacket::from_bytes(&query(&small_name(&mut rng), 1)).unwrap();
+        let records: Vec<Answer> = (0..rng.below(8))
+            .map(|_| {
+                let (tp, data) = match rng.below(7) {
+                    0 => (1, vec![rng.byte(); 4]),
+                    1 => (2, wire(&small_name(&mut rng))),
+                    2 => (5, wire(&small_name(&mut rng))),
+                    3 => {
+                        let mut d = wire(&small_name(&mut rng));
+                        d.extend(wire(&small_name(&mut rng)));
+                        d.extend([rng.byte(); 20]);
+                        (6, d)
+                    }
+                    4 => {
+                        let mut d = vec![0, 10];
+                        d.extend(wire(&small_name(&mut rng)));
+                        (15, d)
+                    }
+                    5 => {
+                        let mut d = vec![0, 1, 0, 2, 0, 3];
+                        d.extend(wire(&small_name(&mut rng)));
+                        (33, d)
+                    }
+                    _ => (16, vec![rng.byte(); rng.below(30)]),
+                };
+                Answer {
+                    name: wire(&small_name(&mut rng)),
+                    tp,
+                    class: 1,
+                    ttl: rng.next() as u32,
+                    data,
+                }
+            })
+            .collect();
+        let (an, ns) = records.split_at(rng.below(records.len() + 1));
+        let bytes = p.response_bytes(RCODE_NOERROR, an, ns, 0);
+        let r = DNSPacket::from_bytes(&bytes)
+            .unwrap_or_else(|| panic!("unparseable response {bytes:02x?}"));
+        assert_eq!(r.questions, p.questions);
+        let got: Vec<_> = r.answers.iter().chain(&r.authorities).collect();
+        assert_eq!(got.len(), records.len());
+        for (g, w) in got.iter().zip(&records) {
+            assert_eq!(
+                (&g.name, g.tp, g.class, g.ttl, &g.data),
+                (&w.name, w.tp, w.class, w.ttl, &w.data)
+            );
+        }
+        // Names inside SRV RDATA must not be compressed (RFC 2782).
+        for w in records.iter().filter(|w| w.tp == 33) {
+            assert!(
+                bytes.windows(w.data.len()).any(|win| win == &w.data[..]),
+                "SRV RDATA was compressed"
+            );
+        }
+    }
+}
+
+/// The 10 SRV records an Active Directory client looks up, with owners
+/// compressed against the question. Rebuilt from the cache without
+/// compression they took 825 bytes, so a client without EDNS got TC=1 and
+/// no answers. Now the rebuilt response is no larger than what an upstream
+/// following RFC 2782 (SRV targets uncompressed) sends, 455 bytes, and
+/// still fits in 512 when the upstream compressed the targets anyway
+/// (295 bytes relayed).
+#[test]
+fn r6_cache_hit_no_larger_than_relayed() {
+    let qname = "_ldap._tcp.dc._msdcs.corp.example.com";
+    let corp = 12 + wire("_ldap._tcp.dc._msdcs").len() - 1; // offset of "corp"
+    for compress_targets in [false, true] {
+        let mut m = header(1, 0x8180, 1, 10, 0, 0);
+        m.extend(wire(qname));
+        m.extend([0, 33, 0, 1]);
+        for i in 0..10u8 {
+            let mut rdata = vec![0, 0, 0, 100, 1, 133, 3, b'd', b'c', b'0' + i];
+            if compress_targets {
+                rdata.extend([0xC0, corp as u8]);
+            } else {
+                rdata.extend(wire("corp.example.com"));
+            }
+            m.extend([0xC0, 12, 0, 33, 0, 1, 0, 0, 14, 16, 0, rdata.len() as u8]);
+            m.extend(rdata);
+        }
+        let p = DNSPacket::from_bytes(&m).unwrap();
+        let rebuilt = p.response_bytes(RCODE_NOERROR, &p.answers, &[], 0);
+        if compress_targets {
+            assert_eq!(m.len(), 295);
+        } else {
+            assert_eq!(m.len(), 455);
+            assert!(rebuilt.len() <= m.len(), "{} > {}", rebuilt.len(), m.len());
+        }
+        assert!(
+            rebuilt.len() <= DEFAULT_UDP_PAYLOAD,
+            "{} bytes",
+            rebuilt.len()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // E1. The client's UDP size limit is its EDNS payload size, clamped to
 //     [512, 4096], or 512 without EDNS.
 // ---------------------------------------------------------------------------
