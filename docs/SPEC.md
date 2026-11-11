@@ -122,9 +122,9 @@ lexicographically at every step), so the argument is machine-checked.
 | R1 | `response_bytes` answers the query: same ID and question, QR = 1, TC = 0, the given RCODE, and section counts equal to the records written | bounded (2k) | `r1_response_bytes_shape` |
 | R2 | Each served TTL is `ttl(r) ⊖ age`, where `⊖` is subtraction saturating at 0 | exhaustive over ages 0–700, plus `u32::MAX` | `r2_ttls_are_aged` |
 | R3 | The truncated form of a response is TC = 1 with the question and no records (RFC 2181 §9) | witness | `r3_truncated_bytes_shape` |
-| R4 | **✗** [#15](https://github.com/vinayakankugoyal/rdns/issues/15) A synthesized response never has AD or Z set; CD is copied from the query (RFC 4035 §3.2.2, §3.2.3; RFC 1035 §4.1.1). rdns validates nothing, so it must not claim AD | refuted | [`bug_ad_bit_forged`](../formal/Rdns/Packet.lean) |
-| R5 | **✗** [#23](https://github.com/vinayakankugoyal/rdns/issues/23) A response to a query with an OPT record carries an OPT record (RFC 6891 §7) | refuted | [`bug_opt_missing`](../formal/Rdns/Packet.lean) |
-| R6 | **✗** [#17](https://github.com/vinayakankugoyal/rdns/issues/17) A response served from the cache is no larger than the relayed response it was built from, apart from TTLs, so a client that got the relayed answer also gets the cached one (needs name compression) | refuted (295 bytes relayed, 825 cached) | [`bug_cache_hit_loses_compression`](../formal/Rdns/Packet.lean) |
+| R4 | A synthesized response never has AD or Z set; CD is copied from the query (RFC 4035 §3.2.2, §3.2.3; RFC 1035 §4.1.1). rdns validates nothing, so it must not claim AD. Regression for [#15](https://github.com/vinayakankugoyal/rdns/issues/15) | **proof** ([`no_forged_ad`](../formal/Rdns/Packet.lean), every query, RCODE and record set) + exhaustive over the query's 8 Z/AD/CD combinations | `r4_synthesized_responses_never_claim_ad_exhaustive` |
+| R5 | A response to a query with an OPT record carries an OPT record (RFC 6891 §7): root owner, the UDP size rdns accepts, version 0, the query's DO bit; a query without OPT gets none. Regression for [#23](https://github.com/vinayakankugoyal/rdns/issues/23) | **proof** of ARCOUNT for every query ([`opt_echoed`](../formal/Rdns/Packet.lean)) + witness for the record itself, for answers, errors and the truncated form | `r5_opt_echoed` |
+| R6 | **Compression:** `response_bytes` compresses question and owner names, and names inside RDATA of the RFC 1035 types only (RFC 3597 §4, RFC 2782); the result decodes to exactly the records written. So a cache hit is no larger than the relayed response of an upstream that compresses where allowed. Regression for [#17](https://github.com/vinayakankugoyal/rdns/issues/17), where 10 SRV records relayed in 295 bytes came back from the cache in 825 | bounded (5k random record sets) + witness; the Lean model compresses identically (differential test), and the kernel checks that the 10-record SRV set now takes 455 bytes ([`cache_hit_fits_after_compression`](../formal/Rdns/Packet.lean)) | `r6_rebuilt_responses_roundtrip`, `r6_cache_hit_no_larger_than_relayed` |
 
 ## 3. Cache
 
@@ -151,8 +151,8 @@ and is ⊥ whenever the value above is 0 or ∞.
 
 where `⊥` means "don't cache" (RFC 1035 §3.2.1, RFC 2308 §5). A response
 with both answers and an SOA is a negative answer reached through a CNAME
-(RFC 2308 §2.1, §2.2), and both bounds apply. The code uses only one of
-them ([#18](https://github.com/vinayakankugoyal/rdns/issues/18)). (Until [#21](https://github.com/vinayakankugoyal/rdns/issues/21) it ignored the top bit.) An entry is
+(RFC 2308 §2.1, §2.2), and both bounds apply (until [#18](https://github.com/vinayakankugoyal/rdns/issues/18) the code used
+only one of them, and until [#21](https://github.com/vinayakankugoyal/rdns/issues/21) it ignored the top bit). An entry is
 kept for `max(cache_ttl(r), min_cache_ttl)`, where `min_cache_ttl` is the
 `--min-cache-ttl` flag (default 0).
 
@@ -161,10 +161,10 @@ kept for `max(cache_ttl(r), min_cache_ttl)`, where `min_cache_ttl` is the
 | C1 | `get(q)` after `insert(q, r)` replays `r`'s answers while the entry is live | witness | `c1_insert_then_get` |
 | C2 | `cleanup(t)` removes exactly the entries that have expired by `t` | witness | `c2_cleanup_removes_only_expired` |
 | C3 | **Honest TTLs:** a record served at time `t` with TTL `s` is dropped downstream by `max(t, its own expiry)`, whatever `min_cache_ttl` is; and the entry is live exactly until it expires. (An earlier wording, "every served TTL ≤ the entry's remaining lifetime", is false for entries with records of different TTLs; see [#24](https://github.com/vinayakankugoyal/rdns/issues/24) and [`c3_as_stated_is_false`](../formal/Rdns/Cache.lean).) | **proof** of the TTL arithmetic ([`served_record_never_outlives_ttl`](../formal/Rdns/Cache.lean)) + exhaustive over `t` in 250 ms steps across a one-record entry's life, for `min_cache_ttl ∈ {0, 300, 1000}` | `c3_served_ttl_never_exceeds_remaining_lifetime_exhaustive` |
-| C4 | **✗** [#18](https://github.com/vinayakankugoyal/rdns/issues/18) The cache stores exactly what `cache_ttl` above allows | witness, one case per branch, including TTLs ≥ 2³¹ ([#21](https://github.com/vinayakankugoyal/rdns/issues/21)); **proof** that no lifetime has the top bit set and that a NOERROR response with such a TTL isn't cached ([`cacheTtl_lt`, `high_bit_ttls_not_cached`](../formal/Rdns/Cache.lean)); refuted for NXDOMAIN behind a CNAME | `c4_cache_ttl_policy`, [`bug_c4_spec_mismatch`](../formal/Rdns/Cache.lean) |
-| C5 | **✗** [#18](https://github.com/vinayakankugoyal/rdns/issues/18), [#19](https://github.com/vinayakankugoyal/rdns/issues/19) A negative entry replays its RCODE, its SOA and the NSEC/NSEC3/RRSIG records of its authority section (RFC 2308 §5), including when it also has answers | witness; refuted for signed and CNAME negatives | `c5_negative_entries_keep_rcode_and_soa`, [`bug_negative_entries_drop_nsec`, `bug_cname_nxdomain_drops_soa`](../formal/Rdns/Cache.lean) |
+| C4 | The cache stores exactly what `cache_ttl` above allows | **proof** for every response ([`cacheTtl_eq_spec`](../formal/Rdns/Cache.lean); NXDOMAIN behind a CNAME and TTLs ≥ 2³¹ were the counterexamples until [#18](https://github.com/vinayakankugoyal/rdns/issues/18) and [#21](https://github.com/vinayakankugoyal/rdns/issues/21)), plus no lifetime has the top bit set ([`cacheTtl_lt`, `high_bit_ttls_not_cached`](../formal/Rdns/Cache.lean)) + witness, one case per branch | `c4_cache_ttl_policy` |
+| C5 | **✗** [#19](https://github.com/vinayakankugoyal/rdns/issues/19) A negative entry replays its RCODE, its SOA and the NSEC/NSEC3/RRSIG records of its authority section (RFC 2308 §5), including when it also has answers | witness (the SOA behind a CNAME since [#18](https://github.com/vinayakankugoyal/rdns/issues/18)); refuted for signed negatives | `c5_negative_entries_keep_rcode_and_soa`, `c5_cname_negatives_keep_soa`, [`bug_negative_entries_drop_nsec`](../formal/Rdns/Cache.lean) |
 | C6 | Lookups use `≡`, so names differing only in case share an entry | witness | `c6_lookups_ignore_case` |
-| C7 | **✗** [#18](https://github.com/vinayakankugoyal/rdns/issues/18) **Nothing stale:** with `min_cache_ttl = 0`, no record is served after its TTL and no negative answer after its negative TTL | **proof** for NOERROR responses with answers ([`positive_entries_never_stale`](../formal/Rdns/Cache.lean)); refuted for negative answers behind a CNAME | [`bug_cname_nxdomain_stale`, `bug_cname_nodata_stale`](../formal/Rdns/Cache.lean) |
+| C7 | **Nothing stale:** with `min_cache_ttl = 0`, no record is served after its TTL and no negative answer after its negative TTL. Regression for [#18](https://github.com/vinayakankugoyal/rdns/issues/18) | **proof** for every response ([`entries_never_stale`, `negative_entries_not_stale`](../formal/Rdns/Cache.lean)) + witness, one per shape | `c7_nothing_served_stale` |
 | C8 | **✗** [#20](https://github.com/vinayakankugoyal/rdns/issues/20) **Honest negative TTLs:** a downstream resolver given a cached negative answer stops believing it by the time its negative TTL runs out, so the served SOA's TTL is at most `min(ttl(s), MINIMUM(s)) ⊖ age` (RFC 2308 §5) | refuted | [`bug_negative_ttl_extended`](../formal/Rdns/Cache.lean) |
 
 C3 is what makes `--min-cache-ttl` safe. rdns may keep a record longer
@@ -200,9 +200,9 @@ scripted upstream resolver and client.
 | F5 | No client gets a response larger than its UDP limit (E1); a response that would exceed it becomes the truncated form (R3), and clients advertising a larger size get the whole response. Upstream replies are read into a 64 KiB buffer, so none is ever cut short, whatever size the client advertised | `f5_large_responses_respect_client_limit` |
 | F6 | A relayed response is byte-for-byte the upstream's apart from the ID, so record types rdns doesn't understand pass through intact | `f6_relay_is_verbatim` |
 | F7 | Blocked names are answered locally, in any case, with a well-typed answer (B1, L2) | `f7_blocking` |
-| F8 | **✗** [#16](https://github.com/vinayakankugoyal/rdns/issues/16) **CD isolation:** a client that leaves CD clear never gets data the upstream would only return with CD set, i.e. data that failed the upstream's DNSSEC validation (RFC 4035 §3.2.2) | [`bug_cd_bypasses_validation`](../formal/Rdns/Forwarder.lean) (refuted) |
+| F8 | **CD isolation:** a client that leaves CD clear never gets data the upstream would only return with CD set, i.e. data that failed the upstream's DNSSEC validation (RFC 4035 §3.2.2). Answers to CD = 1 queries are relayed but not cached. Regression for [#16](https://github.com/vinayakankugoyal/rdns/issues/16) | `f8_cd_answers_are_not_cached`; **proof** ([`cd_isolation`](../formal/Rdns/Forwarder.lean): after any earlier queries, a CD = 0 query gets exactly the upstream's CD = 0 answer) |
 | F9 | **✗** [#19](https://github.com/vinayakankugoyal/rdns/issues/19) A client that leaves DO clear gets no RRSIG, NSEC or NSEC3 records it didn't ask for (RFC 4035 §3.2.1) | (refuted; reproduced end to end) |
-| F10 | **✗** [#22](https://github.com/vinayakankugoyal/rdns/issues/22) A message with an opcode other than QUERY gets NOTIMP and is neither answered from the cache or blocklist nor forwarded (RFC 1035 §4.1.1) | [`bug_opcode_ignored`](../formal/Rdns/Forwarder.lean) (refuted) |
+| F10 | A message with an opcode other than QUERY gets NOTIMP and is neither answered from the cache or blocklist nor forwarded (RFC 1035 §4.1.1). Regression for [#22](https://github.com/vinayakankugoyal/rdns/issues/22) | `f10_other_opcodes_get_notimp`; **proof** ([`other_opcodes_notimp`](../formal/Rdns/Forwarder.lean), whatever is cached) |
 
 How F1 and F2 are achieved: each forwarded query uses its own UDP socket,
 on a port the kernel picks, connected to the resolver so that the kernel
@@ -273,8 +273,8 @@ name decoder makes the model fail to compile.
 
 ## What this spec does not cover
 
-- **Proofs of everything.** H1, P1, half of P2, C3's arithmetic and C7 for
-  positive answers are proved in Lean; the rest are tests. A proof is about
+- **Proofs of everything.** H1, P1, half of P2, C3's arithmetic, C4 and C7
+  are proved in Lean; the rest are tests. A proof is about
   the Lean model, which is compared with the Rust code by differential
   testing, not derived from it. The model leaves out sockets, timeouts and
   transaction IDs (F1, F2). Bounded checks don't cover their whole domain,
