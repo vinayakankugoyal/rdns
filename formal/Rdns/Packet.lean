@@ -140,16 +140,101 @@ def Question.toBytes (q : Question) : Bytes := q.name ++ toBe16 q.tp ++ toBe16 q
 /-- `ttl.saturating_sub(age)`. -/
 def satSub (a b : UInt32) : UInt32 := if a ≥ b then a - b else 0
 
-/-- `Answer::write_to(buf, age)`. `data.len() as u16` truncates. -/
-def Answer.toBytes (a : Answer) (age : UInt32) : Bytes :=
-  a.name ++ toBe16 a.tp ++ toBe16 a.cls ++ toBe32 (satSub a.ttl age)
-    ++ toBe16 (UInt16.ofNat a.data.size) ++ a.data
+/-! ### Name compression (`Compressor`)
+
+The compressor's `HashMap` from suffix to offset is an association list:
+Rust inserts a suffix only after looking it up and missing, so keys are
+unique and the first match is the only one. Loops are structural
+recursion on a fuel argument (each step consumes at least one byte, so
+`name.size + 1` is enough) so that the kernel can evaluate them. -/
+
+abbrev Suffixes := List (Bytes × Nat)
+
+def Suffixes.get? (c : Suffixes) (s : Bytes) : Option Nat := (c.find? (·.1 == s)).map (·.2)
+
+/-- The `while let` loop of `Compressor::write`, from label offset `i`. -/
+def writeNameFrom (name : Bytes) : Nat → Nat → Bytes → Suffixes → Bytes × Suffixes
+  | 0, _, buf, c => (buf, c)
+  | fuel + 1, i, buf, c =>
+    match name[i]? with
+    | none => (buf, c)
+    | some len =>
+      let stop := i + 1 + len.toNat
+      if len = 0 ∨ len.toNat > 63 ∨ stop > name.size then
+        (buf ++ name.extract i name.size, c)          -- the root, or not well formed
+      else
+        let suffix := name.extract i name.size
+        match c.get? suffix with
+        | some off => (buf ++ toBe16 (UInt16.ofNat (0xC000 ||| off)), c)
+        | none =>
+          let c := if buf.size < 0x4000 then (suffix, buf.size) :: c else c
+          writeNameFrom name fuel stop (buf ++ name.extract i stop) c
+
+/-- `Compressor::write`. -/
+def writeName (name : Bytes) (buf : Bytes) (c : Suffixes) : Bytes × Suffixes :=
+  writeNameFrom name (name.size + 1) 0 buf c
+
+/-- `compressible_rdata`: the RFC 1035 types. -/
+def compressibleRdata (tp : UInt16) : Bool :=
+  (2 ≤ tp.toNat ∧ tp.toNat ≤ 9) ∨ tp.toNat = 12 ∨ tp.toNat = 14 ∨ tp.toNat = 15
+
+/-- `name_len`. -/
+def nameLenFrom (b : Bytes) : Nat → Nat → Option Nat
+  | 0, _ => none
+  | fuel + 1, i =>
+    match b[i]? with
+    | none => none
+    | some len =>
+      if len.toNat > 63 then none
+      else
+        let i := i + 1 + len.toNat
+        if len = 0 then (if i ≤ b.size then some i else none) else nameLenFrom b fuel i
+
+def nameLen (b : Bytes) : Option Nat := nameLenFrom b (b.size + 1) 0
+
+/-- `rdata_fields`: the RDATA split into (is a name, bytes). -/
+def rdataFields (a : Answer) : Option (List (Bool × Bytes)) :=
+  if !compressibleRdata a.tp then none
+  else do
+    let layout ← rdataLayout a.tp
+    let rec go : List Field → Bytes → Option (List (Bool × Bytes))
+      | [], rest => if rest.isEmpty then some [] else none
+      | f :: fs, rest => do
+        let (isName, n) ← match f with
+          | .name => (nameLen rest).map (true, ·)
+          | .fixed n => some (false, n)
+        if n > rest.size then none
+        else
+          let tail ← go fs (rest.extract n rest.size)
+          pure ((isName, rest.extract 0 n) :: tail)
+    go layout a.data
+
+/-- `Question::write_to`. -/
+def Question.write (q : Question) (buf : Bytes) (c : Suffixes) : Bytes × Suffixes :=
+  let (buf, c) := writeName q.name buf c
+  (buf ++ toBe16 q.tp ++ toBe16 q.cls, c)
+
+/-- `Answer::write_to(buf, age, names)`. `as u16` truncates. -/
+def Answer.write (a : Answer) (age : UInt32) (buf : Bytes) (c : Suffixes) : Bytes × Suffixes :=
+  let (buf, c) := writeName a.name buf c
+  let buf := buf ++ toBe16 a.tp ++ toBe16 a.cls ++ toBe32 (satSub a.ttl age)
+  let lengthAt := buf.size
+  let buf := buf ++ #[0, 0]
+  let (buf, c) := match rdataFields a with
+    | some fields => fields.foldl (fun (acc : Bytes × Suffixes) (f : Bool × Bytes) =>
+        if f.1 then writeName f.2 acc.1 acc.2 else (acc.1 ++ f.2, acc.2)) (buf, c)
+    | none => (buf ++ a.data, c)
+  let len := toBe16 (UInt16.ofNat (buf.size - lengthAt - 2))
+  ((buf.set! lengthAt len[0]!).set! (lengthAt + 1) len[1]!, c)
+
+/-- `Z_CD`: the CD bit within `Header::z`. -/
+def Z_CD : UInt8 := 0x01
 
 /-- The header `response_bytes` writes. Everything not listed is copied
-from the query header unchanged. -/
+from the query header unchanged. Of `z` (Z, AD, CD) only CD is kept. -/
 def responseHeader (q : Packet) (rcode : UInt8) (nAns nAuth : Nat) : Header :=
   { q.header with
-    qr := 1, ra := 1, aa := 0, tc := 0, rcode := rcode
+    qr := 1, ra := 1, aa := 0, tc := 0, z := q.header.z &&& Z_CD, rcode := rcode
     qdcount := UInt16.ofNat q.questions.size
     ancount := UInt16.ofNat nAns
     nscount := UInt16.ofNat nAuth
@@ -167,10 +252,10 @@ def optRecord (q : Packet) : Bytes :=
 /-- `DNSPacket::response_bytes`. -/
 def Packet.responseBytes (q : Packet) (rcode : UInt8) (answers authorities : Array Answer)
     (age : UInt32) : Bytes :=
-  (responseHeader q rcode answers.size authorities.size).toBytes
-    ++ (q.questions.foldl (fun acc x => acc ++ x.toBytes) #[])
-    ++ ((answers ++ authorities).foldl (fun acc a => acc ++ a.toBytes age) #[])
-    ++ optRecord q
+  let acc := q.questions.foldl (fun (acc : Bytes × Suffixes) x => x.write acc.1 acc.2)
+    ((responseHeader q rcode answers.size authorities.size).toBytes, [])
+  ((answers ++ authorities).foldl (fun (acc : Bytes × Suffixes) a => a.write age acc.1 acc.2)
+    acc).1 ++ optRecord q
 
 /-- `DNSPacket::truncated_bytes`: `buf[2] |= 0x02`. -/
 def Packet.truncatedBytes (q : Packet) (rcode : UInt8) : Bytes :=
@@ -203,47 +288,177 @@ the server has validated every RRset in it. A non-validating server must
 not set it. In a query, AD = 1 only signals that the client understands
 the bit; `dig` sets it by default, and so does glibc with
 `options trust-ad`. The bit is bit 5 of byte 3, which Rust folds into the
-3-bit field `z` (Z, AD, CD) and so copies from the query.
+3-bit field `z` (Z, AD, CD). Before #15 `response_bytes` copied all of `z`
+from the query; RFC 4035 §4.6 describes exactly that failure: "buggy name
+servers that blindly copy header bits that they do not understand from
+the query message to the response message".
 -/
 
 def AD_BIT : UInt8 := 0x20
 
-/-- Byte 3 of the header `response_bytes` writes always carries the query's
-Z, AD and CD bits, for every query. This states the defect; a fix (clearing
-Z and AD) makes it false, and `bug_ad_bit_forged` turns into a proof of
-`NoForgedAD`. Copying CD is correct (RFC 4035 §3.2.2); copying AD and Z is
-not (RFC 4035 §3.2.3, RFC 1035 §4.1.1: Z "must be zero"). RFC 4035 §4.6
-describes this exact failure: "buggy name servers that blindly copy header
-bits that they do not understand from the query message to the response
-message". -/
-theorem response_copies_z (q : Packet) (rcode : UInt8) (n m : Nat) :
-    (responseHeader q rcode n m).z = q.header.z := rfl
+/-- Of the query's Z, AD and CD bits, the response keeps only CD
+(RFC 4035 §3.2.2). -/
+theorem response_z_is_cd (q : Packet) (rcode : UInt8) (n m : Nat) :
+    (responseHeader q rcode n m).z = q.header.z &&& Z_CD := rfl
 
-/-- What rdns should guarantee: a response it synthesizes (cache hit,
-blocked name, SERVFAIL) never claims AD, since rdns validates nothing. -/
-def NoForgedAD (respond : Packet → Bytes) : Prop :=
-  ∀ q : Packet, (respond q)[3]! &&& AD_BIT = 0
+theorem Header.toBytes_size (h : Header) : h.toBytes.size = 12 := by
+  simp [Header.toBytes, toBe16]
+
+/-- Byte 3 of anything that starts with a header is the second flag byte. -/
+theorem Header.byte3 (h : Header) (rest : Bytes) : (h.toBytes ++ rest)[3]! = h.flagBytes.2 := by
+  have hs := h.toBytes_size
+  rw [getElem!_pos (h.toBytes ++ rest) 3 (by simp; omega)]
+  rw [Array.getElem_append_left (by omega)]
+  simp [Header.toBytes, toBe16]
+
+theorem flag3_clean : ∀ z, z < 256 → ∀ r, r < 16 →
+    (((1 : UInt8) <<< 7) ||| (((UInt8.ofNat z) &&& Z_CD) <<< 4) ||| UInt8.ofNat r) &&& 0x60 = 0 := by
+  decide +kernel
+
+/-! ### Serialization only appends
+
+With compression `response_bytes` is no longer a plain concatenation, so
+statements about the header need this: every write keeps the bytes
+already in the buffer (it appends, or patches RDLENGTH past them). -/
+
+/-- `b` starts with `a`. -/
+def Extends (a b : Bytes) : Prop := a.size ≤ b.size ∧ ∀ i < a.size, b[i]! = a[i]!
+
+theorem Extends.refl (a : Bytes) : Extends a a := ⟨Nat.le_refl _, fun _ _ => rfl⟩
+
+theorem Extends.trans {a b c : Bytes} (h1 : Extends a b) (h2 : Extends b c) : Extends a c :=
+  ⟨Nat.le_trans h1.1 h2.1, fun i hi => by rw [h2.2 i (by have := h1.1; omega), h1.2 i hi]⟩
+
+theorem Extends.append (a x : Bytes) : Extends a (a ++ x) := by
+  refine ⟨by simp, fun i hi => ?_⟩
+  rw [getElem!_pos (a ++ x) i (by simp; omega), getElem!_pos a i hi,
+    Array.getElem_append_left hi]
+
+theorem Extends.set {a b : Bytes} (h : Extends a b) (j : Nat) (v : UInt8) (hj : a.size ≤ j) :
+    Extends a (b.set! j v) := by
+  refine ⟨by simp [h.1], fun i hi => ?_⟩
+  rw [← h.2 i hi]
+  have hib : i < b.size := by have := h.1; omega
+  rw [getElem!_pos (b.set! j v) i (by simp; omega), getElem!_pos b i hib]
+  simp only [Array.set!_eq_setIfInBounds]
+  exact Array.getElem_setIfInBounds_ne hib (by omega)
+
+theorem writeNameFrom_extends (name : Bytes) :
+    ∀ fuel i buf c, Extends buf (writeNameFrom name fuel i buf c).1 := by
+  intro fuel
+  induction fuel with
+  | zero => intro i buf c; exact Extends.refl _
+  | succ fuel ih =>
+    intro i buf c
+    unfold writeNameFrom
+    split
+    · exact Extends.refl _
+    · dsimp only
+      split
+      · exact Extends.append _ _
+      · split
+        · exact Extends.append _ _
+        · exact Extends.trans (Extends.append _ _) (ih _ _ _)
+
+theorem writeName_extends (name buf : Bytes) (c : Suffixes) :
+    Extends buf (writeName name buf c).1 := writeNameFrom_extends name _ _ _ _
+
+theorem Question.write_extends (q : Question) (buf : Bytes) (c : Suffixes) :
+    Extends buf (q.write buf c).1 := by
+  unfold Question.write
+  exact Extends.trans (writeName_extends _ _ _)
+    (Extends.trans (Extends.append _ _) (Extends.append _ _))
+
+theorem fields_extends (fields : List (Bool × Bytes)) (acc : Bytes × Suffixes) :
+    Extends acc.1 (fields.foldl (fun (acc : Bytes × Suffixes) (f : Bool × Bytes) =>
+        if f.1 then writeName f.2 acc.1 acc.2 else (acc.1 ++ f.2, acc.2)) acc).1 := by
+  induction fields generalizing acc with
+  | nil => exact Extends.refl _
+  | cons f fs ih =>
+    simp only [List.foldl_cons]
+    refine Extends.trans ?_ (ih _)
+    split
+    · exact writeName_extends _ _ _
+    · exact Extends.append _ _
+
+theorem Answer.write_extends (a : Answer) (age : UInt32) (buf : Bytes) (c : Suffixes) :
+    Extends buf (a.write age buf c).1 := by
+  unfold Answer.write
+  simp only
+  generalize hw : writeName a.name buf c = w
+  have h1 : Extends buf w.1 := hw ▸ writeName_extends _ _ _
+  generalize hb : w.1 ++ toBe16 a.tp ++ toBe16 a.cls ++ toBe32 (satSub a.ttl age) = b1
+  have h2 : Extends buf b1 := hb ▸ Extends.trans h1 (Extends.trans (Extends.append _ _)
+    (Extends.trans (Extends.append _ _) (Extends.append _ _)))
+  have h3 : Extends buf (b1 ++ #[0, 0]) := Extends.trans h2 (Extends.append _ _)
+  have h4 : Extends buf (match rdataFields a with
+      | some fields => fields.foldl (fun (acc : Bytes × Suffixes) (f : Bool × Bytes) =>
+          if f.1 then writeName f.2 acc.1 acc.2 else (acc.1 ++ f.2, acc.2)) (b1 ++ #[0, 0], w.2)
+      | none => (b1 ++ #[0, 0] ++ a.data, w.2)).1 := by
+    split
+    · exact Extends.trans h3 (fields_extends _ (b1 ++ #[0, 0], w.2))
+    · exact Extends.trans h3 (Extends.append _ _)
+  exact (h4.set _ _ (by have := h2.1; omega)).set _ _ (by have := h2.1; omega)
+
+theorem foldl_extends {α} (f : Bytes × Suffixes → α → Bytes × Suffixes)
+    (hf : ∀ acc x, Extends acc.1 (f acc x).1) (xs : Array α) (init : Bytes × Suffixes) :
+    Extends init.1 (xs.foldl f init).1 := by
+  rw [← Array.foldl_toList]
+  induction xs.toList generalizing init with
+  | nil => exact Extends.refl _
+  | cons x l ih => exact Extends.trans (hf _ _) (ih _)
+
+/-- A response starts with its header, byte for byte. -/
+theorem responseBytes_extends (q : Packet) (rcode : UInt8) (answers authorities : Array Answer)
+    (age : UInt32) :
+    Extends (responseHeader q rcode answers.size authorities.size).toBytes
+      (q.responseBytes rcode answers authorities age) := by
+  unfold Packet.responseBytes
+  have hq := foldl_extends (fun (acc : Bytes × Suffixes) (x : Question) => x.write acc.1 acc.2)
+    (fun acc x => Question.write_extends x acc.1 acc.2) q.questions
+    ((responseHeader q rcode answers.size authorities.size).toBytes, [])
+  have ha := foldl_extends (fun (acc : Bytes × Suffixes) (a : Answer) => a.write age acc.1 acc.2)
+    (fun acc a => Answer.write_extends a age acc.1 acc.2) (answers ++ authorities)
+    (q.questions.foldl (fun (acc : Bytes × Suffixes) x => x.write acc.1 acc.2)
+      ((responseHeader q rcode answers.size authorities.size).toBytes, []))
+  exact Extends.trans (Extends.trans hq ha) (Extends.append _ _)
+
+theorem responseBytes_header_byte (q : Packet) (rcode : UInt8) (answers authorities : Array Answer)
+    (age : UInt32) (i : Nat) (hi : i < 12) :
+    (q.responseBytes rcode answers authorities age)[i]!
+      = (responseHeader q rcode answers.size authorities.size).toBytes[i]! :=
+  (responseBytes_extends q rcode answers authorities age).2 i
+    (by rw [Header.toBytes_size]; exact hi)
+
+/-- **R4.** Every response rdns synthesizes (cache hit, blocked name,
+SERVFAIL, truncated form), for every query, RCODE, record set and age,
+has Z = AD = 0. RCODEs are 4 bits: rdns only ever passes a parsed RCODE
+(`& 0x0f`) or a constant. -/
+def NoForgedAD : Prop :=
+  ∀ (q : Packet) (rcode : UInt8) (answers authorities : Array Answer) (age : UInt32),
+    rcode < 16 → (q.responseBytes rcode answers authorities age)[3]! &&& 0x60 = 0
+
+theorem no_forged_ad : NoForgedAD := by
+  intro q rcode answers authorities age hr
+  rw [responseBytes_header_byte q rcode answers authorities age 3 (by decide)]
+  have h3 := Header.byte3 (responseHeader q rcode answers.size authorities.size) #[]
+  rw [Array.append_empty] at h3
+  rw [h3]
+  have := flag3_clean q.header.z.toNat q.header.z.toNat_lt rcode.toNat
+    (by rw [UInt8.lt_iff_toNat_lt] at hr; simpa using hr)
+  simpa [responseHeader, Header.flagBytes] using this
 
 /-- A query exactly as `dig example.com` sends it (flags `0x0120`: RD and
-AD set; with an EDNS OPT record, which doesn't matter here). -/
+AD set). -/
 def digQuery : Packet :=
   { header := Header.ofBytes 0x12 0x34 0x01 0x20 0 1 0 0 0 0 0 0
     questions := #[{ name := #[7, 101, 120, 97, 109, 112, 108, 101, 3, 99, 111, 109, 0],
                      tp := TYPE_A, cls := 1 }]
     answers := #[], authorities := #[], resources := #[] }
 
-/-- **Counterexample (AD).** The cached/blocked/SERVFAIL response to
-`dig`'s default query has AD = 1, so `NoForgedAD` is false, for every
-RCODE, answer set and age. -/
-theorem bug_ad_bit_forged :
-    ¬ NoForgedAD (fun q => q.responseBytes RCODE_NOERROR #[] #[] 0) := by
-  intro h
-  have := h digQuery
-  revert this
-  decide
-
-/-- The same, stated directly on the bytes: byte 3 is `0xA0`, RA and AD. -/
-example : (digQuery.responseBytes RCODE_NOERROR #[] #[] 0)[3]! = 0xA0 := by decide
+/-- The former counterexample: byte 3 of the reply to `dig`'s query was
+`0xA0` (RA | AD); it is now `0x80` (RA). -/
+example : (digQuery.responseBytes RCODE_NOERROR #[] #[] 0)[3]! = 0x80 := by decide
 
 /-! ## Opcode
 
@@ -277,9 +492,6 @@ def OptEchoed : Prop :=
   ∀ (q : Packet) (rcode : UInt8) (answers authorities : Array Answer) (age : UInt32),
     (q.responseBytes rcode answers authorities age)[11]! = if q.hasOpt then 1 else 0
 
-theorem Header.toBytes_size (h : Header) : h.toBytes.size = 12 := by
-  simp [Header.toBytes, toBe16]
-
 /-- Byte 11 of anything that starts with a header is ARCOUNT's low byte. -/
 theorem Header.byte11 (h : Header) (rest : Bytes) :
     (h.toBytes ++ rest)[11]! = UInt8.ofNat (h.arcount.toNat % 256) := by
@@ -293,8 +505,11 @@ one additional record (the OPT record `optRecord` appends), and one to a
 query without OPT says none. Until #23 ARCOUNT was always 0. -/
 theorem opt_echoed : OptEchoed := by
   intro q rcode answers authorities age
-  simp only [Packet.responseBytes, Array.append_assoc, Header.byte11, responseHeader,
-    Packet.hasOpt]
+  rw [responseBytes_header_byte q rcode answers authorities age 11 (by decide)]
+  have h11 := Header.byte11 (responseHeader q rcode answers.size authorities.size) #[]
+  rw [Array.append_empty] at h11
+  rw [h11]
+  simp only [responseHeader, Packet.hasOpt]
   split <;> next h => simp [h]
 
 /-- `dig`'s default query, with its OPT record (UDP size 1232). -/
@@ -356,12 +571,14 @@ kernel can't evaluate `readName`, which is defined by well-founded
 recursion. -/
 #guard Packet.fromBytes srvRaw == some srvParsed
 
-/-- **Counterexample (compression).** The upstream's response is 295 bytes
-and fits a 512-byte client; the cache hit rebuilt from the same records is
-825 bytes, so that client gets TC = 1 and no answers. -/
-theorem bug_cache_hit_loses_compression :
+/-- **The former counterexample (compression).** The upstream's response
+is 295 bytes and fits a 512-byte client. Before #17 the cache hit rebuilt
+from the same records was 825 bytes, so that client got TC = 1 and no
+answers; with compression it is 455 bytes (SRV targets stay uncompressed,
+RFC 2782) and fits. -/
+theorem cache_hit_fits_after_compression :
     srvRaw.size = 295 ∧
-    (srvParsed.responseBytes RCODE_NOERROR srvParsed.answers #[] 1).size = 825 := by
+    (srvParsed.responseBytes RCODE_NOERROR srvParsed.answers #[] 1).size = 455 := by
   decide +kernel
 
 end Rdns

@@ -37,7 +37,9 @@ lake build    # checks every proof
 | `no_underflow` (Name) | in every loop state where Rust evaluates `pos + 2 - start` or `pos - start`, `start ≤ pos` |
 | `opt_echoed` (Packet) | **R5**: a synthesized response has an OPT record exactly when the query did (the counterexample until [#23](https://github.com/vinayakankugoyal/rdns/issues/23)) |
 | `r1_response_header` (Packet) | **R1, header part**: QR = 1, TC = AA = 0, the given RCODE, the query's ID |
+| `no_forged_ad` (Packet) | **R4**: no synthesized response has AD or Z set, for every query, RCODE and record set (the counterexample until [#15](https://github.com/vinayakankugoyal/rdns/issues/15) was fixed) |
 | `served_record_never_outlives_ttl` (Cache) | the TTL arithmetic: a record served at age ⌈t⌉ is dropped downstream by `max(t, its own expiry)` |
+| `cd_isolation` (Forwarder) | **F8**: after any earlier queries, a CD = 0 query gets exactly the upstream's CD = 0 answer (the counterexample until [#16](https://github.com/vinayakankugoyal/rdns/issues/16) was fixed) |
 | `positive_entries_never_stale` (Cache) | without `--min-cache-ttl`, a NOERROR response with answers is never served after any of its records has expired |
 
 Not proved: the second half of P2 (`n = ref(m, i)`), P3 (completeness), and
@@ -47,9 +49,6 @@ anything about sockets, timeouts or transaction IDs.
 
 | Theorem | Property refuted | Issue |
 |---------|------------------|-------|
-| `bug_ad_bit_forged` (Packet) | synthesized responses never claim AD | [#15](https://github.com/vinayakankugoyal/rdns/issues/15) |
-| `bug_cd_bypasses_validation` (Forwarder) | a CD = 0 client never gets data a validating upstream refused it | [#16](https://github.com/vinayakankugoyal/rdns/issues/16) |
-| `bug_cache_hit_loses_compression` (Packet) | a cache hit fits the client whenever the relayed response did | [#17](https://github.com/vinayakankugoyal/rdns/issues/17) |
 | `bug_cname_nxdomain_stale`, `bug_cname_nodata_stale`, `bug_cname_nxdomain_drops_soa`, `bug_c4_spec_mismatch` (Cache) | records and negative answers are never served past their TTL; C4 | [#18](https://github.com/vinayakankugoyal/rdns/issues/18) |
 | `bug_negative_entries_drop_nsec` (Cache) | negative entries keep their NSEC/RRSIG (RFC 2308 §5) | [#19](https://github.com/vinayakankugoyal/rdns/issues/19) |
 | `bug_negative_ttl_extended` (Cache) | downstream never holds a negative answer past its negative TTL | [#20](https://github.com/vinayakankugoyal/rdns/issues/20) |
@@ -57,9 +56,10 @@ anything about sockets, timeouts or transaction IDs.
 | `bug_opcode_ignored` (Forwarder) | non-QUERY opcodes get NOTIMP | [#22](https://github.com/vinayakankugoyal/rdns/issues/22) |
 | `c3_as_stated_is_false` (Cache) | SPEC.md's C3 as written (the spec overclaims) | [#24](https://github.com/vinayakankugoyal/rdns/issues/24) |
 
-`bug_cache_hit_loses_compression` is the one result with a link the kernel
-can't check. The kernel proves the sizes (295 bytes relayed, 825 bytes from
-the cache), but can't evaluate `readName` (well-founded recursion), so the
+`cache_hit_fits_after_compression` (Packet), the former counterexample
+for [#17](https://github.com/vinayakankugoyal/rdns/issues/17), is the one result with a link the kernel can't
+check. The kernel proves the sizes (295 bytes relayed; 455 bytes from the
+cache, 825 before compression), but can't evaluate `readName` (well-founded recursion), so the
 claim that the 295-byte message parses to those records is a `#guard` run
 on the compiled model. That is the same code the differential test compares
 with rdns.

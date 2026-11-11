@@ -9,6 +9,7 @@
 //! (`from_bytes` returns `None`) rather than partially decoded. The
 //! properties this module guarantees are listed in `docs/SPEC.md`.
 
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::hash::{Hash, Hasher};
 
@@ -20,6 +21,10 @@ pub const TYPE_OPT: u16 = 41;
 pub const RCODE_NOERROR: u8 = 0;
 pub const RCODE_SERVFAIL: u8 = 2;
 pub const RCODE_NXDOMAIN: u8 = 3;
+
+/// The CD (checking disabled) bit within `Header::z`, which holds the Z,
+/// AD and CD bits of byte 3 (RFC 4035 §3.2).
+pub const Z_CD: u8 = 0x01;
 
 /// The DO ("DNSSEC OK") bit in an OPT record's TTL field (RFC 3225).
 const OPT_DO: u32 = 0x8000;
@@ -121,8 +126,8 @@ impl Hash for Question {
 }
 
 impl Question {
-    fn write_to(&self, buf: &mut Vec<u8>) {
-        buf.extend_from_slice(&self.name);
+    fn write_to(&self, buf: &mut Vec<u8>, names: &mut Compressor) {
+        names.write(buf, &self.name);
         buf.extend_from_slice(&self.tp.to_be_bytes());
         buf.extend_from_slice(&self.class.to_be_bytes());
     }
@@ -185,13 +190,29 @@ pub struct Answer {
 
 impl Answer {
     /// Writes the record, reducing its TTL by `age` seconds (saturating).
-    fn write_to(&self, buf: &mut Vec<u8>, age: u32) {
-        buf.extend_from_slice(&self.name);
+    /// The owner name, and names inside RDATA where compression is allowed,
+    /// are compressed against names already in `buf`.
+    fn write_to(&self, buf: &mut Vec<u8>, age: u32, names: &mut Compressor) {
+        names.write(buf, &self.name);
         buf.extend_from_slice(&self.tp.to_be_bytes());
         buf.extend_from_slice(&self.class.to_be_bytes());
         buf.extend_from_slice(&self.ttl.saturating_sub(age).to_be_bytes());
-        buf.extend_from_slice(&(self.data.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&self.data);
+        let length_at = buf.len();
+        buf.extend_from_slice(&[0, 0]);
+        match rdata_fields(self) {
+            Some(fields) => {
+                for (is_name, bytes) in fields {
+                    if is_name {
+                        names.write(buf, bytes);
+                    } else {
+                        buf.extend_from_slice(bytes);
+                    }
+                }
+            }
+            None => buf.extend_from_slice(&self.data),
+        }
+        let length = (buf.len() - length_at - 2) as u16;
+        buf[length_at..length_at + 2].copy_from_slice(&length.to_be_bytes());
     }
 
     /// For an SOA record, the MINIMUM field (the last 4 bytes of RDATA),
@@ -242,6 +263,85 @@ fn rdata_layout(tp: u16) -> Option<&'static [Field]> {
         // SRV: priority, weight, port + target
         33 => Some(&[Fixed(6), Name]),
         _ => None,
+    }
+}
+
+/// Whether names inside RDATA of type `tp` may be compressed: only the
+/// RFC 1035 types. RFC 3597 §4 forbids it for every later type, and
+/// RFC 2782 for SRV in particular.
+fn compressible_rdata(tp: u16) -> bool {
+    matches!(tp, 2..=9 | 12 | 14 | 15)
+}
+
+/// `a`'s RDATA split into its fields, each marked as a name or not, if
+/// its names may be compressed and the RDATA matches its layout. The split
+/// happens before anything is written, so a mismatch can't leave the
+/// compressor pointing into bytes that were never sent.
+fn rdata_fields(a: &Answer) -> Option<Vec<(bool, &[u8])>> {
+    if !compressible_rdata(a.tp) {
+        return None;
+    }
+    let mut fields = Vec::new();
+    let mut rest = &a.data[..];
+    for field in rdata_layout(a.tp)? {
+        let (is_name, n) = match field {
+            Field::Name => (true, name_len(rest)?),
+            Field::Fixed(n) => (false, *n),
+        };
+        fields.push((is_name, rest.get(..n)?));
+        rest = &rest[n..];
+    }
+    rest.is_empty().then_some(fields)
+}
+
+/// Length of the uncompressed name at the start of `b`, root label
+/// included.
+fn name_len(b: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    loop {
+        let len = *b.get(i)? as usize;
+        if len > 63 {
+            return None;
+        }
+        i += 1 + len;
+        if len == 0 {
+            return (i <= b.len()).then_some(i);
+        }
+    }
+}
+
+/// Writes names with compression pointers (RFC 1035 §4.1.4): each name
+/// ends in a pointer to the longest suffix already written, byte for byte,
+/// so a decoded name is exactly the name that was written.
+#[derive(Default)]
+struct Compressor {
+    /// Offset of every suffix written so far.
+    suffixes: HashMap<Vec<u8>, u16>,
+}
+
+impl Compressor {
+    /// Writes `name`, an uncompressed wire-format name, to `buf`.
+    fn write(&mut self, buf: &mut Vec<u8>, name: &[u8]) {
+        let mut i = 0;
+        while let Some(&len) = name.get(i) {
+            let end = i + 1 + len as usize;
+            if len == 0 || len > 63 || end > name.len() {
+                // The root, or not a well-formed name: write the rest as is.
+                buf.extend_from_slice(&name[i..]);
+                return;
+            }
+            let suffix = &name[i..];
+            if let Some(&offset) = self.suffixes.get(suffix) {
+                buf.extend_from_slice(&(0xC000 | offset).to_be_bytes());
+                return;
+            }
+            // Pointers hold 14 bits, so later offsets can't be targets.
+            if buf.len() < 0x4000 {
+                self.suffixes.insert(suffix.to_vec(), buf.len() as u16);
+            }
+            buf.extend_from_slice(&name[i..end]);
+            i = end;
+        }
     }
 }
 
@@ -415,11 +515,15 @@ impl DNSPacket {
     /// Serializes a response to this query.
     ///
     /// The header is copied from the query with QR and RA set, the given
-    /// RCODE, and counts matching the records written. Every TTL is
-    /// reduced by `age` seconds, the time the records spent in the cache.
-    /// If the query has an EDNS OPT record, so does the response (RFC 6891
-    /// §7): version 0, the UDP payload size rdns accepts, and the query's
-    /// DO bit.
+    /// RCODE, and counts matching the records written. Of the query's Z, AD
+    /// and CD bits only CD is copied (RFC 4035 §3.2.2): rdns validates
+    /// nothing, so it must never claim AD (RFC 4035 §3.2.3), and Z must be
+    /// zero (RFC 1035 §4.1.1). Every TTL is reduced by `age` seconds, the
+    /// time the records spent in the cache. Names are compressed, so a
+    /// response rebuilt from cached records is no larger than the
+    /// upstream's compressed original. If the query has an EDNS OPT record,
+    /// so does the response (RFC 6891 §7): version 0, the UDP payload size
+    /// rdns accepts, and the query's DO bit.
     pub fn response_bytes(
         &self,
         rcode: u8,
@@ -432,6 +536,7 @@ impl DNSPacket {
         header.ra = 1;
         header.aa = 0;
         header.tc = 0;
+        header.z &= Z_CD;
         header.rcode = rcode;
         header.qdcount = self.questions.len() as u16;
         header.ancount = answers.len() as u16;
@@ -440,12 +545,13 @@ impl DNSPacket {
         header.arcount = u16::from(opt.is_some());
 
         let mut buf = Vec::with_capacity(DEFAULT_UDP_PAYLOAD);
+        let mut names = Compressor::default();
         header.write_to(&mut buf);
         for q in &self.questions {
-            q.write_to(&mut buf);
+            q.write_to(&mut buf, &mut names);
         }
         for a in answers.iter().chain(authorities) {
-            a.write_to(&mut buf, age);
+            a.write_to(&mut buf, age, &mut names);
         }
         if let Some(opt) = opt {
             buf.push(0); // root owner
