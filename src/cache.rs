@@ -6,8 +6,13 @@
 //! * a negative response (NXDOMAIN, or NOERROR with no answers) lives for
 //!   `min(SOA TTL, SOA MINIMUM)`, is replayed with its SOA's TTL capped at
 //!   that value, and is not cached without an SOA;
+//! * a negative answer reached through a CNAME (the CNAME in the answer
+//!   section, the target zone's SOA in the authority section; RFC 2308
+//!   §2.1, §2.2) is bounded by both, and keeps its SOA;
 //! * truncated responses, error responses (SERVFAIL, REFUSED, …) and
-//!   anything with a TTL of 0 are not cached.
+//!   anything with a TTL of 0 are not cached;
+//! * a TTL with the top bit set counts as 0 (RFC 2181 §8), so no entry
+//!   lives longer than 2³¹ − 1 seconds.
 //!
 //! An operator-chosen minimum lifetime (`--min-cache-ttl`) can extend how
 //! long entries are kept, but records are always served with their
@@ -60,20 +65,31 @@ pub fn cache_ttl(response: &DNSPacket) -> Option<u32> {
     if response.header.tc == 1 {
         return None;
     }
+    let answers = response.answers.iter().map(|a| received_ttl(a.ttl)).min();
+    let negative = negative_ttl(response);
     let ttl = match response.header.rcode {
-        RCODE_NOERROR if !response.answers.is_empty() => {
-            response.answers.iter().map(|a| a.ttl).min()?
-        }
-        RCODE_NOERROR | RCODE_NXDOMAIN => {
-            let soa = response
-                .authorities
-                .iter()
-                .find_map(|a| Some((a.ttl, a.soa_minimum()?)))?;
-            soa.0.min(soa.1)
-        }
+        RCODE_NOERROR => answers.into_iter().chain(negative).min()?,
+        RCODE_NXDOMAIN => negative?.min(answers.unwrap_or(u32::MAX)),
         _ => return None,
     };
     (ttl > 0).then_some(ttl)
+}
+
+/// A TTL as received: values with the top bit set count as 0 (RFC 2181
+/// §8: "Implementations should treat TTL values received with the most
+/// significant bit set as if the entire value received was zero").
+fn received_ttl(ttl: u32) -> u32 {
+    if ttl >= 0x8000_0000 { 0 } else { ttl }
+}
+
+/// The negative-caching TTL of `response`, `min(SOA TTL, SOA MINIMUM)` of
+/// the first SOA in its authority section (RFC 2308 §5), if it has one,
+/// with both read as received TTLs (RFC 2181 §8).
+fn negative_ttl(response: &DNSPacket) -> Option<u32> {
+    response
+        .authorities
+        .iter()
+        .find_map(|a| Some(received_ttl(a.ttl).min(received_ttl(a.soa_minimum()?))))
 }
 
 impl DNSCache {
@@ -110,24 +126,21 @@ impl DNSCache {
         let Some(ttl) = cache_ttl(&response) else {
             return false;
         };
-        let negative = response.answers.is_empty();
-        // The SOA is stored with TTL min(TTL, MINIMUM), the negative TTL,
-        // as RFC 2308 §5 has authoritative servers send it. Served with
-        // its remaining TTL, it then tells downstream resolvers how much
-        // of the negative TTL is left; replaying the full SOA TTL would let
+        // The SOA of a negative answer, including one behind a CNAME, is
+        // replayed so downstream resolvers can cache it negatively too. It
+        // is stored with TTL min(TTL, MINIMUM), the negative TTL, as RFC
+        // 2308 §5 has authoritative servers send it. Served with its
+        // remaining TTL, it then tells downstream resolvers how much of
+        // the negative TTL is left; replaying the full SOA TTL would let
         // each of them restart the clock at MINIMUM.
-        let authorities = if negative {
-            response
-                .authorities
-                .into_iter()
-                .filter_map(|mut a| {
-                    a.ttl = a.ttl.min(a.soa_minimum()?);
-                    Some(a)
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let authorities = response
+            .authorities
+            .into_iter()
+            .filter_map(|mut a| {
+                a.ttl = a.ttl.min(a.soa_minimum()?);
+                Some(a)
+            })
+            .collect();
         let entry = CacheEntry {
             response: Arc::new(CachedResponse {
                 rcode: response.header.rcode,
