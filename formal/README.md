@@ -38,6 +38,7 @@ lake build    # checks every proof
 | `r1_response_header` (Packet) | **R1, header part**: QR = 1, TC = AA = 0, the given RCODE, the query's ID |
 | `no_forged_ad` (Packet) | **R4**: no synthesized response has AD or Z set, for every query, RCODE and record set (the counterexample until [#15](https://github.com/vinayakankugoyal/rdns/issues/15) was fixed) |
 | `served_record_never_outlives_ttl` (Cache) | the TTL arithmetic: a record served at age ⌈t⌉ is dropped downstream by `max(t, its own expiry)` |
+| `cd_isolation` (Forwarder) | **F8**: after any earlier queries, a CD = 0 query gets exactly the upstream's CD = 0 answer (the counterexample until [#16](https://github.com/vinayakankugoyal/rdns/issues/16) was fixed) |
 | `positive_entries_never_stale` (Cache) | without `--min-cache-ttl`, a NOERROR response with answers is never served after any of its records has expired |
 
 Not proved: the second half of P2 (`n = ref(m, i)`), P3 (completeness), and
@@ -47,7 +48,6 @@ anything about sockets, timeouts or transaction IDs.
 
 | Theorem | Property refuted | Issue |
 |---------|------------------|-------|
-| `bug_cd_bypasses_validation` (Forwarder) | a CD = 0 client never gets data a validating upstream refused it | [#16](https://github.com/vinayakankugoyal/rdns/issues/16) |
 | `bug_cache_hit_loses_compression` (Packet) | a cache hit fits the client whenever the relayed response did | [#17](https://github.com/vinayakankugoyal/rdns/issues/17) |
 | `bug_cname_nxdomain_stale`, `bug_cname_nodata_stale`, `bug_cname_nxdomain_drops_soa`, `bug_c4_spec_mismatch` (Cache) | records and negative answers are never served past their TTL; C4 | [#18](https://github.com/vinayakankugoyal/rdns/issues/18) |
 | `bug_negative_entries_drop_nsec` (Cache) | negative entries keep their NSEC/RRSIG (RFC 2308 §5) | [#19](https://github.com/vinayakankugoyal/rdns/issues/19) |
