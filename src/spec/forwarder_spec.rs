@@ -4,7 +4,7 @@
 //! scripted fake upstream resolver and a fake client.
 
 use super::*;
-use crate::packet::{RCODE_NXDOMAIN, TYPE_AAAA};
+use crate::packet::{RCODE_NOTIMP, RCODE_NXDOMAIN, TYPE_AAAA};
 
 fn wire(name: &str) -> Vec<u8> {
     let mut out = Vec::new();
@@ -242,7 +242,7 @@ async fn f1_mismatched_replies_ignored() {
         class: 1,
     };
     assert!(
-        h.server.cache.get(&other).is_none(),
+        h.server.cache.get(&other, false).is_none(),
         "unasked question was cached"
     );
 }
@@ -430,6 +430,127 @@ async fn f6_relay_is_verbatim() {
     let r = h.client_recv().await;
     assert_eq!(id_of(&r), 0x0102);
     assert_eq!(r[2..], nx[2..]);
+}
+
+/// F8. CD isolation: an answer obtained with CD=1 (validation disabled
+/// upstream) is never served to a CD=0 client. A validating upstream
+/// refuses the CD=0 query with SERVFAIL; after a CD=1 query for the same
+/// name, the next CD=0 query must still go upstream. Regression for #16.
+#[tokio::test]
+async fn f8_cd_answers_are_not_cached() {
+    let h = Harness::new().await;
+    let up = h
+        .forward(message(1, 0x0110, [0, 0, 0], "bogus.test", &[]))
+        .await;
+    assert_ne!(up.query[3] & 0x10, 0, "CD not forwarded");
+    h.reply(
+        &up,
+        &message(
+            id_of(&up.query),
+            0x8190,
+            [1, 0, 0],
+            "bogus.test",
+            &a_record(3600, [203, 0, 113, 66]),
+        ),
+    )
+    .await;
+    assert!(h.client_recv().await.ends_with(&[203, 0, 113, 66]));
+
+    let up = h.forward(query(2, "bogus.test")).await;
+    h.reply(
+        &up,
+        &message(id_of(&up.query), 0x8182, [0, 0, 0], "bogus.test", &[]),
+    )
+    .await;
+    assert_eq!(rcode_of(&h.client_recv().await), RCODE_SERVFAIL);
+}
+
+/// F10. A message with an opcode other than QUERY gets NOTIMP with its own
+/// opcode, and is neither answered from the cache or blocklist nor
+/// forwarded (RFC 1035 §4.1.1). Before the fix, a NOTIFY for a cached name
+/// got the cached A record. Regression for #22.
+#[tokio::test]
+async fn f10_other_opcodes_get_notimp() {
+    let h = Harness::new().await;
+    let up = h.forward(query(1, "cached.test")).await;
+    h.reply(
+        &up,
+        &message(
+            id_of(&up.query),
+            0x8180,
+            [1, 0, 0],
+            "cached.test",
+            &a_record(600, [192, 0, 2, 1]),
+        ),
+    )
+    .await;
+    let _ = h.client_recv().await;
+    h.server
+        .blocklist
+        .replace(["blocked.test".to_string()].into());
+
+    for opcode in [1u16, 2, 4, 5, 15] {
+        for name in ["cached.test", "blocked.test", "other.test"] {
+            h.ask(message(9, opcode << 11, [0, 0, 0], name, &[]));
+            let r = h.client_recv().await;
+            assert_eq!(rcode_of(&r), RCODE_NOTIMP, "opcode {opcode}, {name}");
+            assert_eq!(u16::from(r[2] >> 3 & 0x0f), opcode);
+            let p = DNSPacket::from_bytes(&r).unwrap();
+            assert!(p.answers.is_empty(), "opcode {opcode}, {name}: answered");
+        }
+    }
+    assert!(h.upstream_is_quiet().await, "a non-QUERY went upstream");
+}
+
+/// A query with an OPT record setting DO.
+fn do_query(id: u16, name: &str) -> Vec<u8> {
+    let mut opt = vec![0, 0, 41, 0x04, 0xD0];
+    opt.extend([0, 0, 0x80, 0, 0, 0]); // ext RCODE, version, DO, Z; RDLENGTH 0
+    message(id, 0x0100, [0, 0, 1], name, &opt)
+}
+
+/// F9. DO isolation: a DO=0 client never gets the RRSIGs fetched for a
+/// DO=1 client, and a DO=1 client is never served an answer fetched
+/// without them. Regression for #19.
+#[tokio::test]
+async fn f9_do_answers_are_kept_apart() {
+    let h = Harness::new().await;
+    let up = h.forward(do_query(1, "signed.test")).await;
+    let mut body = a_record(600, [192, 0, 2, 1]);
+    body.extend([0xC0, 12, 0, 46, 0, 1, 0, 0, 2, 88, 0, 4, 0, 1, 13, 2]); // RRSIG
+    h.reply(
+        &up,
+        &message(id_of(&up.query), 0x8180, [2, 0, 0], "signed.test", &body),
+    )
+    .await;
+    let r = DNSPacket::from_bytes(&h.client_recv().await).unwrap();
+    assert_eq!(r.answers.len(), 2);
+
+    // A DO=0 query isn't answered from the DO=1 entry: it goes upstream.
+    let up = h.forward(query(2, "signed.test")).await;
+    h.reply(
+        &up,
+        &message(
+            id_of(&up.query),
+            0x8180,
+            [1, 0, 0],
+            "signed.test",
+            &a_record(600, [192, 0, 2, 1]),
+        ),
+    )
+    .await;
+    let r = DNSPacket::from_bytes(&h.client_recv().await).unwrap();
+    assert!(r.answers.iter().all(|a| a.tp != 46), "RRSIG sent to DO=0");
+
+    // Both are now cached, each with its own records.
+    h.ask(do_query(3, "signed.test"));
+    let r = DNSPacket::from_bytes(&h.client_recv().await).unwrap();
+    assert!(h.upstream_is_quiet().await);
+    assert_eq!(r.answers.len(), 2);
+    h.ask(query(4, "signed.test"));
+    let r = DNSPacket::from_bytes(&h.client_recv().await).unwrap();
+    assert!(h.upstream_is_quiet().await);
+    assert_eq!(r.answers.len(), 1);
 }
 
 /// F7. Blocked names are blocked in any case, with a well-typed answer.

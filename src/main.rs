@@ -2,7 +2,10 @@
 
 use crate::blocklist::DNSBlocklist;
 use crate::cache::DNSCache;
-use crate::packet::{DNSPacket, MAX_UDP_PAYLOAD, Question, RCODE_NOERROR, RCODE_SERVFAIL, set_id};
+use crate::packet::{
+    DNSPacket, MAX_UDP_PAYLOAD, OPCODE_QUERY, Question, RCODE_NOERROR, RCODE_NOTIMP,
+    RCODE_SERVFAIL, Z_CD, set_id,
+};
 use chrono::Local;
 use clap::Parser;
 use std::io;
@@ -175,6 +178,14 @@ async fn handle_dns_request(server: Arc<Server>, data: Vec<u8>, source: SocketAd
     if packet.header.qr == 1 {
         return;
     }
+    // rdns implements only standard queries. IQUERY, STATUS, NOTIFY,
+    // UPDATE, ... get NOTIMP and are neither answered from the cache or
+    // blocklist nor forwarded (RFC 1035 §4.1.1).
+    if packet.header.opcode != OPCODE_QUERY {
+        let response = packet.response_bytes(RCODE_NOTIMP, &[], &[], 0);
+        let _ = server.reply(&packet, response, source).await;
+        return;
+    }
     let Some(question) = packet.questions.first() else {
         return;
     };
@@ -201,7 +212,8 @@ async fn handle_dns_request(server: Arc<Server>, data: Vec<u8>, source: SocketAd
         return;
     }
 
-    if let Some(hit) = server.cache.get(question) {
+    let dnssec_ok = packet.dnssec_ok();
+    if let Some(hit) = server.cache.get(question, dnssec_ok) {
         metrics::CACHE_HITS.inc();
         let latency = record_latency(start);
 
@@ -247,7 +259,13 @@ async fn handle_dns_request(server: Arc<Server>, data: Vec<u8>, source: SocketAd
         latency.as_millis()
     ));
 
-    server.cache.insert(question.clone(), upstream);
+    // A CD=1 query asks the upstream not to validate DNSSEC, so its answer
+    // may be data the upstream would refuse a CD=0 client. rdns doesn't
+    // validate either, so caching it would hand it to clients that never
+    // asked to skip validation (RFC 4035 §3.2.2).
+    if packet.header.z & Z_CD == 0 {
+        server.cache.insert(question.clone(), dnssec_ok, upstream);
+    }
 }
 
 /// Records the time since `start` in the latency metrics and returns it.
