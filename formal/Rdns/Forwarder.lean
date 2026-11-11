@@ -75,9 +75,11 @@ where
   forward (k : Question) :=
     let r := upstream q.header.cd
     ((r.header.rcode, r.answers),
-     match insertEntry 0 r with
-     | some e => some (k, e)
-     | none => cache)
+     -- Answers to CD = 1 queries are relayed but not cached (#16).
+     if q.header.cd then cache
+     else match insertEntry 0 r with
+       | some e => some (k, e)
+       | none => cache)
 
 /-- A validating upstream and a name with broken DNSSEC: SERVFAIL, unless
 the query sets CD, in which case the unvalidated record comes back. -/
@@ -97,23 +99,100 @@ def CdIsolation : Prop :=
     let cache := earlier.foldl (fun c cd => (handle c validatingUpstream (query cd)).2) none
     ((handle cache validatingUpstream (query false)).1).1 = RCODE_SERVFAIL
 
-/-- Without rdns in the way, a CD = 0 client gets SERVFAIL... -/
+/-- Without rdns in the way, a CD = 0 client gets SERVFAIL. -/
 example : ((handle none validatingUpstream (query false)).1).1 = RCODE_SERVFAIL := by
   decide +kernel
 
-/-- **Counterexample.** ...but after one CD = 1 query for the same name,
-every CD = 0 client gets the unvalidated record from the cache, for the
-record's whole TTL. Anyone who can send rdns a query (it listens on
-0.0.0.0) can switch off the upstream's DNSSEC validation for a name, for
-every client. -/
-theorem bug_cd_bypasses_validation : ¬ CdIsolation := fun h =>
-  absurd (h [true]) (by decide +kernel)
+/-! ### CD isolation, in general
 
-example :
-    let cache := (handle none validatingUpstream (query true)).2
-    (handle cache validatingUpstream (query false)).1 = (RCODE_NOERROR, #[aRec 3600]) := by
-  decide +kernel
+The theorem below is stronger than `CdIsolation`: for *any* upstream and
+*any* earlier queries (any header bits, any CD), a client that leaves CD
+clear gets exactly what the upstream answers with CD clear, no matter
+what earlier clients asked. -/
 
+theorem insertEntry_replays {r : Packet} {e : Entry} (h : insertEntry 0 r = some e) :
+    e.response.rcode = r.header.rcode ∧ e.response.answers = r.answers := by
+  unfold insertEntry at h
+  split at h
+  · simp at h
+  · simp only [Option.some.injEq] at h; subst h; exact ⟨rfl, rfl⟩
+
+/-- Every cache entry was obtained with CD clear. -/
+def FromCd0 (upstream : Bool → Packet) (cache : Option (Question × Entry)) : Prop :=
+  ∀ k e, cache = some (k, e) → insertEntry 0 (upstream false) = some e
+
+theorem handle_keeps_FromCd0 (upstream : Bool → Packet) (cache : Option (Question × Entry))
+    (q : Packet) (h : FromCd0 upstream cache) : FromCd0 upstream (handle cache upstream q).2 := by
+  have hf : ∀ k, FromCd0 upstream (handle.forward cache upstream q k).2 := by
+    intro k k' e he
+    simp only [handle.forward] at he
+    split at he
+    · exact h k' e he
+    · next hcd =>
+      split at he
+      · next e' hins =>
+        simp only [Option.some.injEq, Prod.mk.injEq] at he
+        obtain ⟨-, rfl⟩ := he
+        simpa [hcd] using hins
+      · exact h k' e he
+  unfold handle
+  split
+  · exact h  -- not a QUERY: the cache is untouched
+  · split
+    · exact h
+    · split
+      · split
+        · exact h
+        · exact hf _
+      · exact hf _
+
+theorem foldl_FromCd0 (upstream : Bool → Packet) (l : List Packet) :
+    ∀ c, FromCd0 upstream c → FromCd0 upstream (l.foldl (fun c p => (handle c upstream p).2) c) := by
+  induction l with
+  | nil => intro c h; exact h
+  | cons p ps ih => intro c h; exact ih _ (handle_keeps_FromCd0 upstream c p h)
+
+/-- One CD = 0 query against a cache that holds only CD = 0 answers. -/
+theorem cd0_answer (upstream : Bool → Packet) (cache : Option (Question × Entry)) (q : Packet)
+    (hinv : FromCd0 upstream cache) (hop : q.header.opcode = 0) (hcd : q.header.cd = false)
+    (hq : (cacheKey q).isSome) :
+    (handle cache upstream q).1 = ((upstream false).header.rcode, (upstream false).answers) := by
+  have hfwd : ∀ c k, (handle.forward c upstream q k).1
+      = ((upstream false).header.rcode, (upstream false).answers) := by
+    intro c k; simp [handle.forward, hcd]
+  unfold handle
+  simp only [hop, ne_eq, not_true_eq_false, ↓reduceIte]
+  split
+  · next hk => simp [hk] at hq
+  · cases hc : cache with
+    | none => exact hfwd _ _
+    | some ke =>
+      obtain ⟨k', e⟩ := ke
+      simp only
+      split
+      · obtain ⟨h1, h2⟩ := insertEntry_replays (hinv k' e hc)
+        simp [h1, h2]
+      · exact hfwd _ _
+
+/-- **F8, CD isolation.** After any sequence of earlier queries (any
+opcode, any header bits), a CD = 0 standard query with a question gets
+exactly the upstream's CD = 0 answer. -/
+theorem cd_isolation (upstream : Bool → Packet) (earlier : List Packet) (q : Packet)
+    (hop : q.header.opcode = 0) (hcd : q.header.cd = false) (hq : (cacheKey q).isSome) :
+    (handle (earlier.foldl (fun c p => (handle c upstream p).2) none) upstream q).1
+      = ((upstream false).header.rcode, (upstream false).answers) :=
+  cd0_answer upstream _ q (foldl_FromCd0 upstream earlier none (fun _ _ h => by simp at h))
+    hop hcd hq
+
+/-- The former counterexample: after a CD = 1 query, a CD = 0 client still
+gets the validating upstream's SERVFAIL. -/
+theorem cd_isolation_validating : CdIsolation := by
+  intro earlier
+  have := cd_isolation validatingUpstream (earlier.map query) (query false) (by decide)
+    (by decide) (by decide)
+  simp only [List.foldl_map] at this
+  simp only [this]
+  decide
 
 /-- Lookups ignore case (C6): `Www.Example.com` finds `www.example.com`. -/
 example : (({ name := #[3, 87, 119, 119, 0], tp := 1, cls := 1 } : Question).same

@@ -432,6 +432,39 @@ async fn f6_relay_is_verbatim() {
     assert_eq!(r[2..], nx[2..]);
 }
 
+/// F8. CD isolation: an answer obtained with CD=1 (validation disabled
+/// upstream) is never served to a CD=0 client. A validating upstream
+/// refuses the CD=0 query with SERVFAIL; after a CD=1 query for the same
+/// name, the next CD=0 query must still go upstream. Regression for #16.
+#[tokio::test]
+async fn f8_cd_answers_are_not_cached() {
+    let h = Harness::new().await;
+    let up = h
+        .forward(message(1, 0x0110, [0, 0, 0], "bogus.test", &[]))
+        .await;
+    assert_ne!(up.query[3] & 0x10, 0, "CD not forwarded");
+    h.reply(
+        &up,
+        &message(
+            id_of(&up.query),
+            0x8190,
+            [1, 0, 0],
+            "bogus.test",
+            &a_record(3600, [203, 0, 113, 66]),
+        ),
+    )
+    .await;
+    assert!(h.client_recv().await.ends_with(&[203, 0, 113, 66]));
+
+    let up = h.forward(query(2, "bogus.test")).await;
+    h.reply(
+        &up,
+        &message(id_of(&up.query), 0x8182, [0, 0, 0], "bogus.test", &[]),
+    )
+    .await;
+    assert_eq!(rcode_of(&h.client_recv().await), RCODE_SERVFAIL);
+}
+
 /// F10. A message with an opcode other than QUERY gets NOTIMP with its own
 /// opcode, and is neither answered from the cache or blocklist nor
 /// forwarded (RFC 1035 §4.1.1). Before the fix, a NOTIFY for a cached name

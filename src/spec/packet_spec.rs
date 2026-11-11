@@ -435,6 +435,68 @@ fn r1_response_bytes_shape() {
     }
 }
 
+/// R4. A synthesized response never claims AD and never sets Z, whatever
+/// the query's bits; CD is copied. `dig` sets AD in every query, so before
+/// the fix every cache hit claimed DNSSEC validation. Regression for #15.
+#[test]
+fn r4_synthesized_responses_never_claim_ad_exhaustive() {
+    for z in 0..8u8 {
+        let mut q = query("example.com", 1);
+        q[3] = z << 4; // Z, AD, CD
+        let p = DNSPacket::from_bytes(&q).unwrap();
+        let answers = [p.questions[0].to_blocked_answer().unwrap()];
+        for bytes in [
+            p.response_bytes(RCODE_NOERROR, &answers, &[], 0),
+            p.response_bytes(RCODE_SERVFAIL, &[], &[], 0),
+            p.truncated_bytes(RCODE_NOERROR),
+        ] {
+            assert_eq!(bytes[3] & 0x60, 0, "query z={z:03b}: Z or AD set");
+            assert_eq!(
+                bytes[3] & 0x10,
+                (z & 1) << 4,
+                "query z={z:03b}: CD not copied"
+            );
+        }
+    }
+}
+
+/// R5. A response to a query with an OPT record carries one: root owner,
+/// the UDP size rdns accepts, version 0, and the query's DO bit; a query
+/// without OPT gets none (RFC 6891 §7). Holds for answers, errors and the
+/// truncated form. Regression for #23.
+#[test]
+fn r5_opt_echoed() {
+    for (opt_ttl, has_opt) in [(None, false), (Some(0u32), true), (Some(0x8000), true)] {
+        let mut q = query("example.com", 1);
+        if let Some(ttl) = opt_ttl {
+            q[11] = 1; // ARCOUNT = 1
+            q.extend([0, 0, 41, 0x04, 0xD0]); // root, OPT, payload 1232
+            q.extend(ttl.to_be_bytes());
+            q.extend([0, 0]);
+        }
+        let p = DNSPacket::from_bytes(&q).unwrap();
+        let answers = [p.questions[0].to_blocked_answer().unwrap()];
+        for bytes in [
+            p.response_bytes(RCODE_NOERROR, &answers, &[], 0),
+            p.response_bytes(RCODE_SERVFAIL, &[], &[], 0),
+            p.truncated_bytes(RCODE_NOERROR),
+        ] {
+            let r = DNSPacket::from_bytes(&bytes).expect("response must parse");
+            assert_eq!(r.header.arcount, u16::from(has_opt));
+            match (r.resources.as_slice(), opt_ttl) {
+                ([], None) => {}
+                ([opt], Some(ttl)) => {
+                    assert_eq!((opt.name.as_slice(), opt.tp), (&[0u8][..], TYPE_OPT));
+                    assert_eq!(opt.class as usize, MAX_UDP_PAYLOAD);
+                    assert_eq!(opt.ttl, ttl & 0x8000, "DO not copied, or version/RCODE set");
+                    assert!(opt.data.is_empty());
+                }
+                (rs, _) => panic!("unexpected additional section {rs:?}"),
+            }
+        }
+    }
+}
+
 #[test]
 fn r2_ttls_are_aged() {
     let p = DNSPacket::from_bytes(&query("example.com", 1)).unwrap();
@@ -453,6 +515,122 @@ fn r3_truncated_bytes_shape() {
     assert_eq!((r.header.qr, r.header.tc), (1, 1));
     assert!(r.answers.is_empty());
     assert_eq!(r.questions, p.questions);
+}
+
+// ---------------------------------------------------------------------------
+// R6. Responses rebuilt from records are compressed: they decode to exactly
+//     the records written, and are no larger than the upstream's compressed
+//     original. Regression for #17.
+// ---------------------------------------------------------------------------
+
+/// A random name over a tiny alphabet, so suffixes repeat.
+fn small_name(rng: &mut Rng) -> String {
+    (0..1 + rng.below(4))
+        .map(|_| ["a", "bb", "Ccc", "example", "com"][rng.below(5)])
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+#[test]
+fn r6_rebuilt_responses_roundtrip() {
+    let mut rng = Rng(17);
+    for _ in 0..5_000 {
+        let p = DNSPacket::from_bytes(&query(&small_name(&mut rng), 1)).unwrap();
+        let records: Vec<Answer> = (0..rng.below(8))
+            .map(|_| {
+                let (tp, data) = match rng.below(7) {
+                    0 => (1, vec![rng.byte(); 4]),
+                    1 => (2, wire(&small_name(&mut rng))),
+                    2 => (5, wire(&small_name(&mut rng))),
+                    3 => {
+                        let mut d = wire(&small_name(&mut rng));
+                        d.extend(wire(&small_name(&mut rng)));
+                        d.extend([rng.byte(); 20]);
+                        (6, d)
+                    }
+                    4 => {
+                        let mut d = vec![0, 10];
+                        d.extend(wire(&small_name(&mut rng)));
+                        (15, d)
+                    }
+                    5 => {
+                        let mut d = vec![0, 1, 0, 2, 0, 3];
+                        d.extend(wire(&small_name(&mut rng)));
+                        (33, d)
+                    }
+                    _ => (16, vec![rng.byte(); rng.below(30)]),
+                };
+                Answer {
+                    name: wire(&small_name(&mut rng)),
+                    tp,
+                    class: 1,
+                    ttl: rng.next() as u32,
+                    data,
+                }
+            })
+            .collect();
+        let (an, ns) = records.split_at(rng.below(records.len() + 1));
+        let bytes = p.response_bytes(RCODE_NOERROR, an, ns, 0);
+        let r = DNSPacket::from_bytes(&bytes)
+            .unwrap_or_else(|| panic!("unparseable response {bytes:02x?}"));
+        assert_eq!(r.questions, p.questions);
+        let got: Vec<_> = r.answers.iter().chain(&r.authorities).collect();
+        assert_eq!(got.len(), records.len());
+        for (g, w) in got.iter().zip(&records) {
+            assert_eq!(
+                (&g.name, g.tp, g.class, g.ttl, &g.data),
+                (&w.name, w.tp, w.class, w.ttl, &w.data)
+            );
+        }
+        // Names inside SRV RDATA must not be compressed (RFC 2782).
+        for w in records.iter().filter(|w| w.tp == 33) {
+            assert!(
+                bytes.windows(w.data.len()).any(|win| win == &w.data[..]),
+                "SRV RDATA was compressed"
+            );
+        }
+    }
+}
+
+/// The 10 SRV records an Active Directory client looks up, with owners
+/// compressed against the question. Rebuilt from the cache without
+/// compression they took 825 bytes, so a client without EDNS got TC=1 and
+/// no answers. Now the rebuilt response is no larger than what an upstream
+/// following RFC 2782 (SRV targets uncompressed) sends, 455 bytes, and
+/// still fits in 512 when the upstream compressed the targets anyway
+/// (295 bytes relayed).
+#[test]
+fn r6_cache_hit_no_larger_than_relayed() {
+    let qname = "_ldap._tcp.dc._msdcs.corp.example.com";
+    let corp = 12 + wire("_ldap._tcp.dc._msdcs").len() - 1; // offset of "corp"
+    for compress_targets in [false, true] {
+        let mut m = header(1, 0x8180, 1, 10, 0, 0);
+        m.extend(wire(qname));
+        m.extend([0, 33, 0, 1]);
+        for i in 0..10u8 {
+            let mut rdata = vec![0, 0, 0, 100, 1, 133, 3, b'd', b'c', b'0' + i];
+            if compress_targets {
+                rdata.extend([0xC0, corp as u8]);
+            } else {
+                rdata.extend(wire("corp.example.com"));
+            }
+            m.extend([0xC0, 12, 0, 33, 0, 1, 0, 0, 14, 16, 0, rdata.len() as u8]);
+            m.extend(rdata);
+        }
+        let p = DNSPacket::from_bytes(&m).unwrap();
+        let rebuilt = p.response_bytes(RCODE_NOERROR, &p.answers, &[], 0);
+        if compress_targets {
+            assert_eq!(m.len(), 295);
+        } else {
+            assert_eq!(m.len(), 455);
+            assert!(rebuilt.len() <= m.len(), "{} > {}", rebuilt.len(), m.len());
+        }
+        assert!(
+            rebuilt.len() <= DEFAULT_UDP_PAYLOAD,
+            "{} bytes",
+            rebuilt.len()
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

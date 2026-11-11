@@ -4,7 +4,7 @@ use crate::blocklist::DNSBlocklist;
 use crate::cache::DNSCache;
 use crate::packet::{
     DNSPacket, MAX_UDP_PAYLOAD, OPCODE_QUERY, Question, RCODE_NOERROR, RCODE_NOTIMP,
-    RCODE_SERVFAIL, set_id,
+    RCODE_SERVFAIL, Z_CD, set_id,
 };
 use chrono::Local;
 use clap::Parser;
@@ -258,7 +258,13 @@ async fn handle_dns_request(server: Arc<Server>, data: Vec<u8>, source: SocketAd
         latency.as_millis()
     ));
 
-    server.cache.insert(question.clone(), upstream);
+    // A CD=1 query asks the upstream not to validate DNSSEC, so its answer
+    // may be data the upstream would refuse a CD=0 client. rdns doesn't
+    // validate either, so caching it would hand it to clients that never
+    // asked to skip validation (RFC 4035 §3.2.2).
+    if packet.header.z & Z_CD == 0 {
+        server.cache.insert(question.clone(), upstream);
+    }
 }
 
 /// Records the time since `start` in the latency metrics and returns it.
