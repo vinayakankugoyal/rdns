@@ -145,11 +145,14 @@ def Answer.toBytes (a : Answer) (age : UInt32) : Bytes :=
   a.name ++ toBe16 a.tp ++ toBe16 a.cls ++ toBe32 (satSub a.ttl age)
     ++ toBe16 (UInt16.ofNat a.data.size) ++ a.data
 
+/-- `Z_CD`: the CD bit within `Header::z`. -/
+def Z_CD : UInt8 := 0x01
+
 /-- The header `response_bytes` writes. Everything not listed is copied
-from the query header unchanged. -/
+from the query header unchanged. Of `z` (Z, AD, CD) only CD is kept. -/
 def responseHeader (q : Packet) (rcode : UInt8) (nAns nAuth : Nat) : Header :=
   { q.header with
-    qr := 1, ra := 1, aa := 0, tc := 0, rcode := rcode
+    qr := 1, ra := 1, aa := 0, tc := 0, z := q.header.z &&& Z_CD, rcode := rcode
     qdcount := UInt16.ofNat q.questions.size
     ancount := UInt16.ofNat nAns
     nscount := UInt16.ofNat nAuth
@@ -193,47 +196,59 @@ the server has validated every RRset in it. A non-validating server must
 not set it. In a query, AD = 1 only signals that the client understands
 the bit; `dig` sets it by default, and so does glibc with
 `options trust-ad`. The bit is bit 5 of byte 3, which Rust folds into the
-3-bit field `z` (Z, AD, CD) and so copies from the query.
+3-bit field `z` (Z, AD, CD). Before #15 `response_bytes` copied all of `z`
+from the query; RFC 4035 §4.6 describes exactly that failure: "buggy name
+servers that blindly copy header bits that they do not understand from
+the query message to the response message".
 -/
 
 def AD_BIT : UInt8 := 0x20
 
-/-- Byte 3 of the header `response_bytes` writes always carries the query's
-Z, AD and CD bits, for every query. This states the defect; a fix (clearing
-Z and AD) makes it false, and `bug_ad_bit_forged` turns into a proof of
-`NoForgedAD`. Copying CD is correct (RFC 4035 §3.2.2); copying AD and Z is
-not (RFC 4035 §3.2.3, RFC 1035 §4.1.1: Z "must be zero"). RFC 4035 §4.6
-describes this exact failure: "buggy name servers that blindly copy header
-bits that they do not understand from the query message to the response
-message". -/
-theorem response_copies_z (q : Packet) (rcode : UInt8) (n m : Nat) :
-    (responseHeader q rcode n m).z = q.header.z := rfl
+/-- Of the query's Z, AD and CD bits, the response keeps only CD
+(RFC 4035 §3.2.2). -/
+theorem response_z_is_cd (q : Packet) (rcode : UInt8) (n m : Nat) :
+    (responseHeader q rcode n m).z = q.header.z &&& Z_CD := rfl
 
-/-- What rdns should guarantee: a response it synthesizes (cache hit,
-blocked name, SERVFAIL) never claims AD, since rdns validates nothing. -/
-def NoForgedAD (respond : Packet → Bytes) : Prop :=
-  ∀ q : Packet, (respond q)[3]! &&& AD_BIT = 0
+theorem Header.toBytes_size (h : Header) : h.toBytes.size = 12 := by
+  simp [Header.toBytes, toBe16]
+
+/-- Byte 3 of anything that starts with a header is the second flag byte. -/
+theorem Header.byte3 (h : Header) (rest : Bytes) : (h.toBytes ++ rest)[3]! = h.flagBytes.2 := by
+  have hs := h.toBytes_size
+  rw [getElem!_pos (h.toBytes ++ rest) 3 (by simp; omega)]
+  rw [Array.getElem_append_left (by omega)]
+  simp [Header.toBytes, toBe16]
+
+theorem flag3_clean : ∀ z, z < 256 → ∀ r, r < 16 →
+    (((1 : UInt8) <<< 7) ||| (((UInt8.ofNat z) &&& Z_CD) <<< 4) ||| UInt8.ofNat r) &&& 0x60 = 0 := by
+  decide +kernel
+
+/-- **R4.** Every response rdns synthesizes (cache hit, blocked name,
+SERVFAIL, truncated form), for every query, RCODE, record set and age,
+has Z = AD = 0. RCODEs are 4 bits: rdns only ever passes a parsed RCODE
+(`& 0x0f`) or a constant. -/
+def NoForgedAD : Prop :=
+  ∀ (q : Packet) (rcode : UInt8) (answers authorities : Array Answer) (age : UInt32),
+    rcode < 16 → (q.responseBytes rcode answers authorities age)[3]! &&& 0x60 = 0
+
+theorem no_forged_ad : NoForgedAD := by
+  intro q rcode answers authorities age hr
+  simp only [Packet.responseBytes, Array.append_assoc, Header.byte3]
+  have := flag3_clean q.header.z.toNat q.header.z.toNat_lt rcode.toNat
+    (by rw [UInt8.lt_iff_toNat_lt] at hr; simpa using hr)
+  simpa [responseHeader, Header.flagBytes] using this
 
 /-- A query exactly as `dig example.com` sends it (flags `0x0120`: RD and
-AD set; with an EDNS OPT record, which doesn't matter here). -/
+AD set). -/
 def digQuery : Packet :=
   { header := Header.ofBytes 0x12 0x34 0x01 0x20 0 1 0 0 0 0 0 0
     questions := #[{ name := #[7, 101, 120, 97, 109, 112, 108, 101, 3, 99, 111, 109, 0],
                      tp := TYPE_A, cls := 1 }]
     answers := #[], authorities := #[], resources := #[] }
 
-/-- **Counterexample (AD).** The cached/blocked/SERVFAIL response to
-`dig`'s default query has AD = 1, so `NoForgedAD` is false, for every
-RCODE, answer set and age. -/
-theorem bug_ad_bit_forged :
-    ¬ NoForgedAD (fun q => q.responseBytes RCODE_NOERROR #[] #[] 0) := by
-  intro h
-  have := h digQuery
-  revert this
-  decide
-
-/-- The same, stated directly on the bytes: byte 3 is `0xA0`, RA and AD. -/
-example : (digQuery.responseBytes RCODE_NOERROR #[] #[] 0)[3]! = 0xA0 := by decide
+/-- The former counterexample: byte 3 of the reply to `dig`'s query was
+`0xA0` (RA | AD); it is now `0x80` (RA). -/
+example : (digQuery.responseBytes RCODE_NOERROR #[] #[] 0)[3]! = 0x80 := by decide
 
 /-! ## Opcode
 
