@@ -10,9 +10,10 @@ fixed, and each has a test that fails if it comes back.
 A second pass modelled rdns in Lean 4 ([`formal/`](../formal)) and proved
 the properties that hold. It found ten more ([#15](https://github.com/vinayakankugoyal/rdns/issues/15)–[#24](https://github.com/vinayakankugoyal/rdns/issues/24)), among them a
 forged DNSSEC "authenticated" bit and a way for any client to turn off
-the upstream's DNSSEC validation. These are still open, and the
-properties they break are marked **✗** below. Each such property states
-what rdns *should* do. None was weakened to fit the code.
+the upstream's DNSSEC validation. Each property they broke states what
+rdns *should* do, and none was weakened to fit the code. All ten are now
+fixed (PRs #26–#35), and most of their counterexamples have become
+proofs.
 
 - [How to read this](#how-to-read-this)
 - [Definitions](#definitions)
@@ -160,7 +161,7 @@ kept for `max(cache_ttl(r), min_cache_ttl)`, where `min_cache_ttl` is the
 |----|----------|-------|------|
 | C1 | `get(q)` after `insert(q, r)` replays `r`'s answers while the entry is live | witness | `c1_insert_then_get` |
 | C2 | `cleanup(t)` removes exactly the entries that have expired by `t` | witness | `c2_cleanup_removes_only_expired` |
-| C3 | **Honest TTLs:** a record served at time `t` with TTL `s` is dropped downstream by `max(t, its own expiry)`, whatever `min_cache_ttl` is; and the entry is live exactly until it expires. (An earlier wording, "every served TTL ≤ the entry's remaining lifetime", is false for entries with records of different TTLs; see [#24](https://github.com/vinayakankugoyal/rdns/issues/24) and [`c3_as_stated_is_false`](../formal/Rdns/Cache.lean).) | **proof** of the TTL arithmetic ([`served_record_never_outlives_ttl`](../formal/Rdns/Cache.lean)) + exhaustive over `t` in 250 ms steps across a one-record entry's life, for `min_cache_ttl ∈ {0, 300, 1000}` | `c3_served_ttl_never_exceeds_remaining_lifetime_exhaustive` |
+| C3 | **Honest TTLs:** a record served at time `t` with TTL `s` is dropped downstream by `max(t, its own expiry)`, whatever `min_cache_ttl` is; and the entry is live exactly until it expires. (An earlier wording, "every served TTL ≤ the entry's remaining lifetime", is false for entries with records of different TTLs; see [#24](https://github.com/vinayakankugoyal/rdns/issues/24) and [`c3_as_stated_is_false`](../formal/Rdns/Cache.lean).) | **proof** of the TTL arithmetic ([`served_record_never_outlives_ttl`](../formal/Rdns/Cache.lean)) + exhaustive over `t` in 250 ms steps across the life of a one-record entry and of an entry with TTLs 60, 3600 and 600, for `min_cache_ttl ∈ {0, 300, 1000}` | `c3_served_ttl_never_exceeds_remaining_lifetime_exhaustive`, `c3_records_never_outlive_their_ttl_exhaustive` |
 | C4 | The cache stores exactly what `cache_ttl` above allows | **proof** for every response ([`cacheTtl_eq_spec`](../formal/Rdns/Cache.lean); NXDOMAIN behind a CNAME and TTLs ≥ 2³¹ were the counterexamples until [#18](https://github.com/vinayakankugoyal/rdns/issues/18) and [#21](https://github.com/vinayakankugoyal/rdns/issues/21)), plus no lifetime has the top bit set ([`cacheTtl_lt`, `high_bit_ttls_not_cached`](../formal/Rdns/Cache.lean)) + witness, one case per branch | `c4_cache_ttl_policy` |
 | C5 | A negative entry replays its RCODE, its SOA (TTL capped at MINIMUM, C8) and the NSEC/NSEC3/RRSIG records of its authority section (RFC 2308 §5), including when it also has answers; other authority records are dropped. Regression for [#18](https://github.com/vinayakankugoyal/rdns/issues/18) and [#19](https://github.com/vinayakankugoyal/rdns/issues/19) | **proof** for every response ([`negative_entries_keep_proofs`, `negative_entries_keep_soa`](../formal/Rdns/Cache.lean)) + witness | `c5_negative_entries_keep_rcode_and_soa`, `c5_cname_negatives_keep_soa`, `c5_negative_entries_keep_dnssec_proofs` |
 | C6 | Lookups use `≡`, so names differing only in case share an entry | witness | `c6_lookups_ignore_case` |
@@ -249,7 +250,8 @@ P1's cycle witnesses run in a child process.
 
 Against `70e3552` (rdns after PR #14). Each issue reproduces the bug on
 the real binary ([`formal/repro/e2e.py`](../formal/repro/e2e.py)) and links its
-Lean counterexample.
+Lean counterexample. All ten were fixed in PRs #26–#35; each fix carries a
+regression test, and the property it broke is no longer marked **✗**.
 
 | Issue | Property | What is wrong | Severity |
 |-------|----------|---------------|----------|

@@ -118,6 +118,57 @@ fn c3_served_ttl_never_exceeds_remaining_lifetime_exhaustive() {
     }
 }
 
+/// C3, per record: in an entry whose records have different TTLs, every
+/// record served at time `t` with TTL `s` is dropped downstream by
+/// `max(t, its own expiry)`, for every age and minimum TTL setting. The
+/// test above only inserts one record. Regression for #24, which found
+/// that C3's earlier wording ("every served TTL ≤ the entry's remaining
+/// lifetime") is false for such entries; the last assertion keeps that
+/// counterexample.
+#[test]
+fn c3_records_never_outlive_their_ttl_exhaustive() {
+    let ttls = [60, 3600, 600];
+    for min_ttl in [0, 300, 1000] {
+        let c = DNSCache::new(min_ttl);
+        let t0 = Instant::now();
+        c.insert_at(
+            question("example.com"),
+            false,
+            response("example.com", NOERROR_FLAGS, &ttls, None),
+            t0,
+        );
+        let lifetime = Duration::from_secs(60u64.max(min_ttl.into()));
+        for ms in (0..=4_000_000).step_by(250) {
+            let t = Duration::from_millis(ms);
+            let hit = c.get_at(&question("example.com"), false, t0 + t);
+            assert_eq!(hit.is_some(), t < lifetime, "min_ttl={min_ttl} t={ms}ms");
+            let Some(hit) = hit else { continue };
+            for a in &hit.response.answers {
+                let served = Duration::from_secs(a.ttl.saturating_sub(hit.age).into());
+                let expiry = Duration::from_secs(a.ttl.into());
+                assert!(
+                    t + served <= t.max(expiry),
+                    "min_ttl={min_ttl} t={ms}ms: TTL {} record held until {:?}",
+                    a.ttl,
+                    t + served
+                );
+            }
+        }
+    }
+    // The old wording's counterexample: at t = 0 the entry has 60 s left,
+    // but the 3600 s record is (rightly) served with TTL 3600.
+    let c = DNSCache::new(0);
+    let t0 = Instant::now();
+    c.insert_at(
+        question("example.com"),
+        false,
+        response("example.com", NOERROR_FLAGS, &ttls, None),
+        t0,
+    );
+    let hit = c.get_at(&question("example.com"), false, t0).unwrap();
+    assert!(hit.response.answers.iter().any(|a| a.ttl > 60));
+}
+
 /// C4. The cache-lifetime policy (RFC 1035 §3.2.1, RFC 2308). Regression
 /// for #11, #12 and #13.
 #[test]
