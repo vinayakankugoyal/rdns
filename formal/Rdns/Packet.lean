@@ -17,6 +17,9 @@ def TYPE_A : UInt16 := 1
 def TYPE_SOA : UInt16 := 6
 def TYPE_AAAA : UInt16 := 28
 def TYPE_OPT : UInt16 := 41
+def TYPE_RRSIG : UInt16 := 46
+def TYPE_NSEC : UInt16 := 47
+def TYPE_NSEC3 : UInt16 := 50
 
 def RCODE_NOERROR : UInt8 := 0
 def RCODE_SERVFAIL : UInt8 := 2
@@ -276,6 +279,12 @@ def Packet.udpPayloadLimit (q : Packet) : Nat :=
     | some opt => opt.cls.toNat
     | none => DEFAULT_UDP_PAYLOAD
   max DEFAULT_UDP_PAYLOAD (min v MAX_UDP_PAYLOAD)
+
+/-- `DNSPacket::dnssec_ok`: the DO bit of the first OPT record's flags. -/
+def Packet.dnssecOk (q : Packet) : Bool :=
+  match q.resources.find? (·.tp = TYPE_OPT) with
+  | some opt => opt.ttl &&& 0x8000 ≠ 0
+  | none => false
 
 /-- `set_id`. -/
 def setId (buf : Bytes) (id : UInt16) : Bytes :=

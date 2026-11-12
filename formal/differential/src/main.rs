@@ -86,6 +86,7 @@ fn record(r: &mut Rng, m: &mut Vec<u8>, s: &mut Vec<usize>, soa: bool) {
         0 => 0,
         1 => r.below(600) as u32,
         2 => 0x8000_0000 | r.next() as u32,
+        3 if tp == 41 => (r.next() as u32) & 0xFFFF_8000, // OPT: DO set or not
         _ => r.next() as u32,
     };
     m.extend(ttl.to_be_bytes());
@@ -198,7 +199,7 @@ fn render(buf: &[u8]) -> String {
     let h = &p.header;
     let ttl = cache::cache_ttl(&p).map_or("-".to_string(), |t| t.to_string());
     format!(
-        "H:{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}|Q:{}|A:{}|N:{}|R:{}|ttl:{}|resp:{}|tr:{}|lim:{}",
+        "H:{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}.{}|Q:{}|A:{}|N:{}|R:{}|ttl:{}|resp:{}|tr:{}|lim:{}|do:{}",
         h.packet_id, h.qr, h.opcode, h.aa, h.tc, h.rd, h.ra, h.z, h.rcode,
         h.qdcount, h.ancount, h.nscount, h.arcount,
         list(&p.questions, render_q),
@@ -209,6 +210,7 @@ fn render(buf: &[u8]) -> String {
         hex(&p.response_bytes(h.rcode, &p.answers, &p.authorities, 7)),
         hex(&p.truncated_bytes(h.rcode)),
         p.udp_payload_limit(),
+        p.dnssec_ok(),
     )
 }
 

@@ -212,7 +212,8 @@ async fn handle_dns_request(server: Arc<Server>, data: Vec<u8>, source: SocketAd
         return;
     }
 
-    if let Some(hit) = server.cache.get(question) {
+    let dnssec_ok = packet.dnssec_ok();
+    if let Some(hit) = server.cache.get(question, dnssec_ok) {
         metrics::CACHE_HITS.inc();
         let latency = record_latency(start);
 
@@ -263,7 +264,7 @@ async fn handle_dns_request(server: Arc<Server>, data: Vec<u8>, source: SocketAd
     // validate either, so caching it would hand it to clients that never
     // asked to skip validation (RFC 4035 §3.2.2).
     if packet.header.z & Z_CD == 0 {
-        server.cache.insert(question.clone(), upstream);
+        server.cache.insert(question.clone(), dnssec_ok, upstream);
     }
 }
 

@@ -48,6 +48,7 @@ def render (buf : Bytes) : String :=
       ++ s!"|R:{renderList renderA p.resources}|ttl:{ttl}"
       ++ s!"|resp:{toHex (p.responseBytes p.header.rcode p.answers p.authorities 7)}"
       ++ s!"|tr:{toHex (p.truncatedBytes p.header.rcode)}|lim:{p.udpPayloadLimit}"
+      ++ s!"|do:{p.dnssecOk}"
 
 partial def loop (stdin : IO.FS.Stream) (stdout : IO.FS.Stream) : IO Unit := do
   let line ← stdin.getLine

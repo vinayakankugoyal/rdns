@@ -242,7 +242,7 @@ async fn f1_mismatched_replies_ignored() {
         class: 1,
     };
     assert!(
-        h.server.cache.get(&other).is_none(),
+        h.server.cache.get(&other, false).is_none(),
         "unasked question was cached"
     );
 }
@@ -500,6 +500,57 @@ async fn f10_other_opcodes_get_notimp() {
         }
     }
     assert!(h.upstream_is_quiet().await, "a non-QUERY went upstream");
+}
+
+/// A query with an OPT record setting DO.
+fn do_query(id: u16, name: &str) -> Vec<u8> {
+    let mut opt = vec![0, 0, 41, 0x04, 0xD0];
+    opt.extend([0, 0, 0x80, 0, 0, 0]); // ext RCODE, version, DO, Z; RDLENGTH 0
+    message(id, 0x0100, [0, 0, 1], name, &opt)
+}
+
+/// F9. DO isolation: a DO=0 client never gets the RRSIGs fetched for a
+/// DO=1 client, and a DO=1 client is never served an answer fetched
+/// without them. Regression for #19.
+#[tokio::test]
+async fn f9_do_answers_are_kept_apart() {
+    let h = Harness::new().await;
+    let up = h.forward(do_query(1, "signed.test")).await;
+    let mut body = a_record(600, [192, 0, 2, 1]);
+    body.extend([0xC0, 12, 0, 46, 0, 1, 0, 0, 2, 88, 0, 4, 0, 1, 13, 2]); // RRSIG
+    h.reply(
+        &up,
+        &message(id_of(&up.query), 0x8180, [2, 0, 0], "signed.test", &body),
+    )
+    .await;
+    let r = DNSPacket::from_bytes(&h.client_recv().await).unwrap();
+    assert_eq!(r.answers.len(), 2);
+
+    // A DO=0 query isn't answered from the DO=1 entry: it goes upstream.
+    let up = h.forward(query(2, "signed.test")).await;
+    h.reply(
+        &up,
+        &message(
+            id_of(&up.query),
+            0x8180,
+            [1, 0, 0],
+            "signed.test",
+            &a_record(600, [192, 0, 2, 1]),
+        ),
+    )
+    .await;
+    let r = DNSPacket::from_bytes(&h.client_recv().await).unwrap();
+    assert!(r.answers.iter().all(|a| a.tp != 46), "RRSIG sent to DO=0");
+
+    // Both are now cached, each with its own records.
+    h.ask(do_query(3, "signed.test"));
+    let r = DNSPacket::from_bytes(&h.client_recv().await).unwrap();
+    assert!(h.upstream_is_quiet().await);
+    assert_eq!(r.answers.len(), 2);
+    h.ask(query(4, "signed.test"));
+    let r = DNSPacket::from_bytes(&h.client_recv().await).unwrap();
+    assert!(h.upstream_is_quiet().await);
+    assert_eq!(r.answers.len(), 1);
 }
 
 /// F7. Blocked names are blocked in any case, with a well-typed answer.

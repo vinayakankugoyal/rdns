@@ -43,10 +43,15 @@ def Question.same (a b : Question) : Bool :=
   a.tp == b.tp && a.cls == b.cls && a.name.size == b.name.size
     && (a.name.zip b.name).all (fun p => asciiLower p.1 == asciiLower p.2)
 
-/-- The key `handle_dns_request` uses for `cache.get` and `cache.insert`. -/
-def cacheKey (q : Packet) : Option Question := q.questions[0]?
+/-- The key `handle_dns_request` uses for `cache.get` and `cache.insert`:
+the first question and the query's DO bit (#19). -/
+def cacheKey (q : Packet) : Option (Question × Bool) := q.questions[0]?.map (·, q.dnssecOk)
 
-/-- The cache key doesn't depend on the query header at all. -/
+/-- Key equality: `Question`'s case-insensitive `Eq`, and the DO bit. -/
+def keySame (a b : Question × Bool) : Bool := a.1.same b.1 && a.2 == b.2
+
+/-- The cache key doesn't depend on the query header at all. (DO lives in
+the OPT record, not the header.) -/
 theorem cacheKey_ignores_header (q : Packet) (h : Header) :
     cacheKey { q with header := h } = cacheKey q := rfl
 
@@ -59,8 +64,8 @@ TTL aging. `upstream cd` is the response the
 upstream resolver gives for the query's question when the query carries
 that CD bit. Returns the RCODE and answers the client gets, and the new
 cache. -/
-def handle (cache : Option (Question × Entry)) (upstream : Bool → Packet) (q : Packet) :
-    (UInt8 × Array Answer) × Option (Question × Entry) :=
+def handle (cache : Option ((Question × Bool) × Entry)) (upstream : Bool → Packet) (q : Packet) :
+    (UInt8 × Array Answer) × Option ((Question × Bool) × Entry) :=
   -- Only standard queries are served; anything else gets NOTIMP (#22).
   if q.header.opcode ≠ 0 then ((RCODE_NOTIMP, #[]), cache) else
   match cacheKey q with
@@ -68,11 +73,11 @@ def handle (cache : Option (Question × Entry)) (upstream : Bool → Packet) (q 
   | some k =>
     match cache with
     | some (k', e) =>
-      if k'.same k then ((e.response.rcode, e.response.answers), cache)
+      if keySame k' k then ((e.response.rcode, e.response.answers), cache)
       else forward k
     | none => forward k
 where
-  forward (k : Question) :=
+  forward (k : Question × Bool) :=
     let r := upstream q.header.cd
     ((r.header.rcode, r.answers),
      -- Answers to CD = 1 queries are relayed but not cached (#16).
@@ -118,10 +123,10 @@ theorem insertEntry_replays {r : Packet} {e : Entry} (h : insertEntry 0 r = some
   · simp only [Option.some.injEq] at h; subst h; exact ⟨rfl, rfl⟩
 
 /-- Every cache entry was obtained with CD clear. -/
-def FromCd0 (upstream : Bool → Packet) (cache : Option (Question × Entry)) : Prop :=
+def FromCd0 (upstream : Bool → Packet) (cache : Option ((Question × Bool) × Entry)) : Prop :=
   ∀ k e, cache = some (k, e) → insertEntry 0 (upstream false) = some e
 
-theorem handle_keeps_FromCd0 (upstream : Bool → Packet) (cache : Option (Question × Entry))
+theorem handle_keeps_FromCd0 (upstream : Bool → Packet) (cache : Option ((Question × Bool) × Entry))
     (q : Packet) (h : FromCd0 upstream cache) : FromCd0 upstream (handle cache upstream q).2 := by
   have hf : ∀ k, FromCd0 upstream (handle.forward cache upstream q k).2 := by
     intro k k' e he
@@ -153,7 +158,7 @@ theorem foldl_FromCd0 (upstream : Bool → Packet) (l : List Packet) :
   | cons p ps ih => intro c h; exact ih _ (handle_keeps_FromCd0 upstream c p h)
 
 /-- One CD = 0 query against a cache that holds only CD = 0 answers. -/
-theorem cd0_answer (upstream : Bool → Packet) (cache : Option (Question × Entry)) (q : Packet)
+theorem cd0_answer (upstream : Bool → Packet) (cache : Option ((Question × Bool) × Entry)) (q : Packet)
     (hinv : FromCd0 upstream cache) (hop : q.header.opcode = 0) (hcd : q.header.cd = false)
     (hq : (cacheKey q).isSome) :
     (handle cache upstream q).1 = ((upstream false).header.rcode, (upstream false).answers) := by
@@ -204,7 +209,7 @@ example : (({ name := #[3, 87, 119, 119, 0], tp := 1, cls := 1 } : Question).sam
 not support the requested kind of query") for opcodes it doesn't
 implement. rdns implements only QUERY (0). -/
 def OtherOpcodesNotImp : Prop :=
-  ∀ (cache : Option (Question × Entry)) (upstream : Bool → Packet) (q : Packet),
+  ∀ (cache : Option ((Question × Bool) × Entry)) (upstream : Bool → Packet) (q : Packet),
     q.header.opcode ≠ 0 → (handle cache upstream q).1 = (RCODE_NOTIMP, #[])
       ∧ (handle cache upstream q).2 = cache
 
@@ -214,5 +219,17 @@ cached answer. -/
 theorem other_opcodes_notimp : OtherOpcodesNotImp := by
   intro cache upstream q h
   simp [handle, h]
+
+/-! ## DO isolation (#19) -/
+
+/-- **F9.** An entry stored for a query with one DO bit never answers a
+query with the other: the query is forwarded instead. -/
+theorem do_isolation (k : Question × Bool) (e : Entry) (upstream : Bool → Packet) (q : Packet)
+    (kq : Question) (hop : q.header.opcode = 0) (hk : cacheKey q = some (kq, !k.2)) :
+    handle (some (k, e)) upstream q = handle.forward (some (k, e)) upstream q (kq, !k.2) := by
+  unfold handle
+  simp only [hop, ne_eq, not_true_eq_false, ↓reduceIte]
+  rw [hk]
+  simp [keySame]
 
 end Rdns
