@@ -33,16 +33,27 @@ def Answer.soaMinimum (a : Answer) : Option UInt32 :=
 def minTtl? (as : Array Answer) : Option UInt32 :=
   as.foldl (fun acc a => some (match acc with | none => a.ttl | some m => min m a.ttl)) none
 
+/-- `negative_ttl`: `min(SOA TTL, MINIMUM)` of the first SOA. -/
+def negativeTtl (auth : Array Answer) : Option UInt32 :=
+  auth.findSome? (fun a => a.soaMinimum.map (fun m => min a.ttl m))
+
+/-- `a.into_iter().chain(b).min()`. -/
+def minOpt : Option UInt32 → Option UInt32 → Option UInt32
+  | none, none => none
+  | some x, none => some x
+  | none, some y => some y
+  | some x, some y => some (min x y)
+
 /-- `cache_ttl`. -/
 def cacheTtl (r : Packet) : Option UInt32 :=
   if r.header.tc = 1 then none
   else
+    let answers := minTtl? r.answers
+    let negative := negativeTtl r.authorities
     let ttl? : Option UInt32 :=
-      if r.header.rcode = RCODE_NOERROR ∧ ¬ r.answers.isEmpty then
-        minTtl? r.answers
-      else if r.header.rcode = RCODE_NOERROR ∨ r.header.rcode = RCODE_NXDOMAIN then
-        (r.authorities.findSome? (fun a => a.soaMinimum.map (fun m => (a.ttl, m)))).map
-          (fun p => min p.1 p.2)
+      if r.header.rcode = RCODE_NOERROR then minOpt answers negative
+      else if r.header.rcode = RCODE_NXDOMAIN then
+        negative.map (fun n => min n (answers.getD 0xFFFFFFFF))
       else none
     match ttl? with
     | some t => if t > 0 then some t else none
@@ -65,8 +76,7 @@ def insertEntry (minTtl : UInt32) (r : Packet) : Option Entry :=
   match cacheTtl r with
   | none => none
   | some ttl =>
-    let negative := r.answers.isEmpty
-    let authorities := if negative then r.authorities.filter (·.soaMinimum.isSome) else #[]
+    let authorities := r.authorities.filter (·.soaMinimum.isSome)
     some { response := { rcode := r.header.rcode, answers := r.answers, authorities }
            lifetime := (max ttl minTtl).toNat }
 
@@ -182,39 +192,124 @@ theorem minTtl?_le (as : Array Answer) (m : UInt32) (h : minTtl? as = some m) :
         | inl e => subst e; exact u32_le_trans hmin hx
         | inr e => exact h2 a e
 
-/-- **No stale positive answers.** Without `--min-cache-ttl`, a NOERROR
-response with answers is never served after any of its records has
-expired: the entry lives exactly as long as its shortest TTL. -/
-theorem positive_entries_never_stale (r : Packet) (e : Entry) (t : Nat)
-    (hpos : r.header.rcode = RCODE_NOERROR) (hne : ¬ r.answers.isEmpty)
+theorem foldl_min_some (l : List Answer) (x : UInt32) :
+    (l.foldl (fun acc a => some (match acc with | none => a.ttl | some m => min m a.ttl))
+      (some x)).isSome := by
+  induction l generalizing x with
+  | nil => rfl
+  | cons a l ih => exact ih _
+
+/-- `min()` of a non-empty iterator is `Some`. -/
+theorem minTtl?_none (as : Array Answer) (h : minTtl? as = none) : ∀ a ∈ as, False := by
+  intro a ha
+  unfold minTtl? at h
+  rw [← Array.foldl_toList] at h
+  have hmem := Array.mem_toList_iff.mpr ha
+  cases hl : as.toList with
+  | nil => simp [hl] at hmem
+  | cons b l =>
+    rw [hl] at h
+    have := foldl_min_some l b.ttl
+    simp only [List.foldl_cons] at h
+    rw [h] at this; simp at this
+
+theorem minOpt_le {a b : Option UInt32} {t : UInt32} (h : minOpt a b = some t) :
+    (∀ x, a = some x → t ≤ x) ∧ (∀ y, b = some y → t ≤ y) := by
+  have refl : ∀ x : UInt32, x ≤ x := fun x => UInt32.le_iff_toNat_le.mpr (Nat.le_refl _)
+  cases a with
+  | none => cases b with
+    | none => simp [minOpt] at h
+    | some y =>
+      simp only [minOpt, Option.some.injEq] at h; subst h
+      exact ⟨fun _ hx => by simp at hx, fun _ hy => by cases hy; exact refl _⟩
+  | some x => cases b with
+    | none =>
+      simp only [minOpt, Option.some.injEq] at h; subst h
+      exact ⟨fun _ hx => by cases hx; exact refl _, fun _ hy => by simp at hy⟩
+    | some y =>
+      simp only [minOpt, Option.some.injEq] at h; subst h
+      exact ⟨fun _ hx => by cases hx; exact u32_min_le_left _ _,
+             fun _ hy => by cases hy; exact u32_min_le_right _ _⟩
+
+/-- **The lifetime is a lower bound.** Whatever `cache_ttl` returns is at
+most every answer's TTL and at most the negative TTL. -/
+theorem cacheTtl_le (r : Packet) (t : UInt32) (h : cacheTtl r = some t) :
+    (∀ a ∈ r.answers, t ≤ a.ttl) ∧ (∀ n, negativeTtl r.authorities = some n → t ≤ n) := by
+  unfold cacheTtl at h
+  split at h
+  · simp at h
+  · -- strip the `t > 0` test
+    have key : ∀ ttl? : Option UInt32, (match ttl? with
+        | some t => if t > 0 then some t else none | none => none) = some t → ttl? = some t := by
+      intro o ho; cases o with
+      | none => simp at ho
+      | some x => simp only at ho; split at ho <;> simp_all
+    have h := key _ h
+    have hans : ∀ m, minTtl? r.answers = some m → ∀ a ∈ r.answers, m ≤ a.ttl :=
+      fun m hm => minTtl?_le r.answers m hm
+    split at h
+    · obtain ⟨h1, h2⟩ := minOpt_le h
+      refine ⟨fun a ha => ?_, h2⟩
+      cases hm : minTtl? r.answers with
+      | none => exact (minTtl?_none _ hm a ha).elim
+      | some m => exact u32_le_trans (h1 m hm) (hans m hm a ha)
+    · split at h
+      · cases hn : negativeTtl r.authorities with
+        | none => simp [hn] at h
+        | some n =>
+          simp only [hn, Option.map_some, Option.some.injEq] at h
+          subst h
+          refine ⟨fun a ha => ?_, fun n' hn' => ?_⟩
+          · cases hm : minTtl? r.answers with
+            | none => exact (minTtl?_none _ hm a ha).elim
+            | some m =>
+              simp only [hm, Option.getD_some]
+              exact u32_le_trans (u32_min_le_right _ _) (hans m hm a ha)
+          · cases hn'; exact u32_min_le_left _ _
+      · simp at h
+
+theorem insertEntry_lifetime {r : Packet} {e : Entry} (h : insertEntry 0 r = some e) :
+    ∃ t, cacheTtl r = some t ∧ e.lifetime = t.toNat := by
+  unfold insertEntry at h
+  split at h
+  · simp at h
+  · next t ht =>
+    simp only [Option.some.injEq] at h; subst h
+    exact ⟨t, ht, by rw [u32_max_zero]⟩
+
+/-- **C7, no stale records.** Without `--min-cache-ttl`, no record is
+served after its TTL has run out, for every response rdns caches. -/
+theorem entries_never_stale (r : Packet) (e : Entry) (t : Nat)
     (hins : insertEntry 0 r = some e) (hlive : e.live t) :
     ∀ a ∈ e.response.answers, t < a.ttl.toNat * NS := by
-  unfold insertEntry at hins
-  split at hins
-  next => simp at hins
-  next ttl hc =>
-    simp only [Option.some.injEq] at hins
-    subst hins
-    intro a ha
-    unfold cacheTtl at hc
-    split at hc
-    next => simp at hc
-    next htc =>
-      simp only [hpos, hne, not_false_eq_true, and_self, ↓reduceIte] at hc
-      split at hc
-      next m hm =>
-        split at hc
-        next =>
-          simp only [Option.some.injEq] at hc; subst hc
-          have := minTtl?_le r.answers m hm a ha
-          have hle : m.toNat ≤ a.ttl.toNat := UInt32.le_iff_toNat_le.mp this
-          simp only [Entry.live] at hlive
-          have : (max m 0).toNat = m.toNat := by rw [u32_max_zero]
-          rw [this] at hlive
-          have := Nat.mul_le_mul_right NS hle
-          omega
-        next => simp at hc
-      next => simp at hc
+  obtain ⟨ttl, hc, hl⟩ := insertEntry_lifetime hins
+  have hans : e.response.answers = r.answers := by
+    unfold insertEntry at hins; rw [hc] at hins; simp only [Option.some.injEq] at hins
+    rw [← hins]
+  intro a ha
+  rw [hans] at ha
+  have := UInt32.le_iff_toNat_le.mp ((cacheTtl_le r ttl hc).1 a ha)
+  simp only [Entry.live, hl] at hlive
+  have := Nat.mul_le_mul_right NS this
+  omega
+
+/-- The NOERROR case, as it was proved before #18. -/
+theorem positive_entries_never_stale (r : Packet) (e : Entry) (t : Nat)
+    (hins : insertEntry 0 r = some e) (hlive : e.live t) :
+    ∀ a ∈ e.response.answers, t < a.ttl.toNat * NS :=
+  entries_never_stale r e t hins hlive
+
+/-- **C7, no stale negative answers.** Without `--min-cache-ttl`, a
+response with an SOA is not served after its negative TTL has run out,
+including a negative answer behind a CNAME. -/
+theorem negative_entries_not_stale (r : Packet) (e : Entry) (t : Nat) (n : UInt32)
+    (hins : insertEntry 0 r = some e) (hlive : e.live t)
+    (hn : negativeTtl r.authorities = some n) : t < n.toNat * NS := by
+  obtain ⟨ttl, hc, hl⟩ := insertEntry_lifetime hins
+  have := UInt32.le_iff_toNat_le.mp ((cacheTtl_le r ttl hc).2 n hn)
+  simp only [Entry.live, hl] at hlive
+  have := Nat.mul_le_mul_right NS this
+  omega
 
 /-! ## Properties that fail
 
@@ -285,71 +380,72 @@ theorem bug_negative_ttl_extended : ¬ NegativeAnswersHonest := fun h =>
 example : negHonestAt 3600 (resp RCODE_NXDOMAIN #[] #[soa 86400 300]) (3599 * NS) = false := by
   decide +kernel
 
-/-! ### Negative answers behind a CNAME are cached on the wrong TTL -/
+/-! ### Negative answers behind a CNAME
 
-def negNotStaleAt (r : Packet) (t : Nat) : Bool :=
-  match insertEntry 0 r, negTtl r.authorities with
-  | some e, some n => if e.live t then decide (t < n * NS) else true
-  | _, _ => true
+Until #18, `cache_ttl` bounded a negative answer behind a CNAME by only one
+of its two TTLs, and `insert_at` dropped its SOA. The counterexamples were:
 
-/-- **No stale negative answers.** Without `--min-cache-ttl`, rdns stops
-serving a negative answer (NXDOMAIN, or NOERROR/NODATA with an SOA) once
-its negative TTL has run out. -/
-def NegativeEntriesNotStale : Prop := ∀ r t, negNotStaleAt r t = true
+* NODATA behind a CNAME (TTL 3600) with negative TTL 60: "no AAAA" was
+  served for an hour (`entries_never_stale`, `negative_entries_not_stale`
+  above now rule this out for every response);
+* NXDOMAIN behind a 30-second CNAME with negative TTL 3600: the CNAME was
+  served for an hour;
+* the replayed NXDOMAIN had no SOA. -/
 
-/-- **Counterexample (NODATA behind a CNAME).** The AAAA query for a name
-that is a CNAME (TTL 3600) to a target with no AAAA records is answered
-NOERROR, with the CNAME and the target zone's SOA (negative TTL 60). rdns
-takes the entry's lifetime from the CNAME alone, so it keeps answering
-"no AAAA" for an hour, 60 times longer than allowed. -/
-theorem bug_cname_nodata_stale : ¬ NegativeEntriesNotStale := fun h =>
-  absurd (h (resp RCODE_NOERROR #[cname 3600] #[soa 60 60]) (3000 * NS)) (by decide +kernel)
+example : (insertEntry 0 (resp RCODE_NOERROR #[cname 3600] #[soa 60 60])).map (·.lifetime)
+    = some 60 := by decide +kernel
 
-def notStaleAt (r : Packet) (t : Nat) : Bool :=
-  match insertEntry 0 r with
-  | some e => if e.live t then e.response.answers.all (fun a => decide (t < a.ttl.toNat * NS))
-              else true
-  | none => true
+example : (insertEntry 0 (resp RCODE_NXDOMAIN #[cname 30] #[soa 3600 3600])).map (·.lifetime)
+    = some 30 := by decide +kernel
 
-/-- **No stale records.** Without `--min-cache-ttl`, rdns never serves a
-record after its TTL has run out. `positive_entries_never_stale` proves
-this for NOERROR responses; this is the same promise for all responses. -/
-def EntriesNeverStale : Prop := ∀ r t, notStaleAt r t = true
+/-- The SOA of a negative answer behind a CNAME is kept. -/
+example : (insertEntry 0 (resp RCODE_NXDOMAIN #[cname 30] #[soa 3600 3600])).map
+      (·.response.authorities.size) = some 1 := by decide +kernel
 
-/-- **Counterexample (NXDOMAIN behind a CNAME).** `www` is a CNAME
-(TTL 30) to a name that doesn't exist; the target zone's SOA gives a
-negative TTL of 3600. rdns takes the lifetime from the SOA alone and keeps
-serving the 30-second CNAME for an hour (with TTL 0 once it has expired),
-so a changed CNAME isn't seen for an hour. -/
-theorem bug_cname_nxdomain_stale : ¬ EntriesNeverStale := fun h =>
-  absurd (h (resp RCODE_NXDOMAIN #[cname 30] #[soa 3600 3600]) (1000 * NS)) (by decide +kernel)
-
-/-- ...and the replayed NXDOMAIN has lost its SOA, so (RFC 2308 §5)
-downstream resolvers can't cache it negatively at all. -/
-theorem bug_cname_nxdomain_drops_soa :
-    (insertEntry 0 (resp RCODE_NXDOMAIN #[cname 30] #[soa 3600 3600])).map
-      (·.response.authorities.size) = some 0 := by decide +kernel
-
-/-- `cache_ttl` exactly as `docs/SPEC.md` §3 defines it: the SOA branch
-applies only when there are no answers. -/
+/-- `cache_ttl` as `docs/SPEC.md` §3 defines it, with `∞` as `none`:
+`min(A(r), N(r))` for NOERROR, and for NXDOMAIN with an SOA. -/
 def specCacheTtl (r : Packet) : Option UInt32 :=
   if r.header.tc = 1 then none
   else
+    let a := minTtl? r.answers
+    let n := negativeTtl r.authorities
     let ttl? : Option UInt32 :=
-      if r.header.rcode = RCODE_NOERROR ∧ ¬ r.answers.isEmpty then minTtl? r.answers
-      else if (r.header.rcode = RCODE_NOERROR ∨ r.header.rcode = RCODE_NXDOMAIN)
-          ∧ r.answers.isEmpty then
-        (r.authorities.findSome? (fun a => a.soaMinimum.map (fun m => (a.ttl, m)))).map
-          (fun p => min p.1 p.2)
+      if r.header.rcode = RCODE_NOERROR ∨ (r.header.rcode = RCODE_NXDOMAIN ∧ n.isSome) then
+        minOpt a n
       else none
     match ttl? with
     | some t => if t > 0 then some t else none
     | none => none
 
-/-- **C4 doesn't hold as the spec writes it**: the code caches an
-NXDOMAIN-with-answers response that the spec's `cache_ttl` refuses. -/
-theorem bug_c4_spec_mismatch : ¬ ∀ r, cacheTtl r = specCacheTtl r := fun h =>
-  absurd (h (resp RCODE_NXDOMAIN #[cname 30] #[soa 3600 3600])) (by decide +kernel)
+theorem u32_min_comm (a b : UInt32) : min a b = min b a := by
+  apply UInt32.toNat_inj.mp
+  rw [UInt32.min_def, UInt32.min_def]
+  split <;> split <;> simp_all [UInt32.le_iff_toNat_le] <;> omega
+
+theorem u32_min_max (a : UInt32) : min a 0xFFFFFFFF = a := by
+  rw [UInt32.min_def]; split
+  · rfl
+  · next h => exact absurd (UInt32.le_iff_toNat_le.mpr (by have := a.toNat_lt; simp; omega)) h
+
+/-- **C4** (apart from the top-bit clause, #21): `cache_ttl` is the spec's
+definition, for every response. The former counterexample, NXDOMAIN
+behind a CNAME, is one instance. -/
+theorem cacheTtl_eq_spec (r : Packet) : cacheTtl r = specCacheTtl r := by
+  unfold cacheTtl specCacheTtl
+  split
+  · rfl
+  · congr 1
+    by_cases h1 : r.header.rcode = RCODE_NOERROR
+    · simp [h1]
+    · by_cases h2 : r.header.rcode = RCODE_NXDOMAIN
+      · simp only [h1, h2, ↓reduceIte, true_and, false_or]
+        cases negativeTtl r.authorities with
+        | none => rfl
+        | some n =>
+          cases minTtl? r.answers with
+          | none => simp [minOpt, u32_min_max]
+          | some m => simp [minOpt, u32_min_comm]
+      · simp [h1, h2]
 
 /-! ### TTLs with the top bit set -/
 

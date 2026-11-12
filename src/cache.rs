@@ -5,6 +5,9 @@
 //! * a NOERROR response with answers lives for its smallest record TTL;
 //! * a negative response (NXDOMAIN, or NOERROR with no answers) lives for
 //!   `min(SOA TTL, SOA MINIMUM)` and is not cached without an SOA;
+//! * a negative answer reached through a CNAME (the CNAME in the answer
+//!   section, the target zone's SOA in the authority section; RFC 2308
+//!   §2.1, §2.2) is bounded by both, and keeps its SOA;
 //! * truncated responses, error responses (SERVFAIL, REFUSED, …) and
 //!   anything with a TTL of 0 are not cached.
 //!
@@ -59,20 +62,23 @@ pub fn cache_ttl(response: &DNSPacket) -> Option<u32> {
     if response.header.tc == 1 {
         return None;
     }
+    let answers = response.answers.iter().map(|a| a.ttl).min();
+    let negative = negative_ttl(response);
     let ttl = match response.header.rcode {
-        RCODE_NOERROR if !response.answers.is_empty() => {
-            response.answers.iter().map(|a| a.ttl).min()?
-        }
-        RCODE_NOERROR | RCODE_NXDOMAIN => {
-            let soa = response
-                .authorities
-                .iter()
-                .find_map(|a| Some((a.ttl, a.soa_minimum()?)))?;
-            soa.0.min(soa.1)
-        }
+        RCODE_NOERROR => answers.into_iter().chain(negative).min()?,
+        RCODE_NXDOMAIN => negative?.min(answers.unwrap_or(u32::MAX)),
         _ => return None,
     };
     (ttl > 0).then_some(ttl)
+}
+
+/// The negative-caching TTL of `response`, `min(SOA TTL, SOA MINIMUM)` of
+/// the first SOA in its authority section (RFC 2308 §5), if it has one.
+fn negative_ttl(response: &DNSPacket) -> Option<u32> {
+    response
+        .authorities
+        .iter()
+        .find_map(|a| Some(a.ttl.min(a.soa_minimum()?)))
 }
 
 impl DNSCache {
@@ -109,16 +115,13 @@ impl DNSCache {
         let Some(ttl) = cache_ttl(&response) else {
             return false;
         };
-        let negative = response.answers.is_empty();
-        let authorities = if negative {
-            response
-                .authorities
-                .into_iter()
-                .filter(|a| a.soa_minimum().is_some())
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // The SOA of a negative answer, including one behind a CNAME, is
+        // replayed so downstream resolvers can cache it negatively too.
+        let authorities = response
+            .authorities
+            .into_iter()
+            .filter(|a| a.soa_minimum().is_some())
+            .collect();
         let entry = CacheEntry {
             response: Arc::new(CachedResponse {
                 rcode: response.header.rcode,

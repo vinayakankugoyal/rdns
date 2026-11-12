@@ -21,10 +21,17 @@ pub const TYPE_OPT: u16 = 41;
 pub const RCODE_NOERROR: u8 = 0;
 pub const RCODE_SERVFAIL: u8 = 2;
 pub const RCODE_NXDOMAIN: u8 = 3;
+pub const RCODE_NOTIMP: u8 = 4;
+
+/// OPCODE of a standard query (RFC 1035 §4.1.1), the only kind rdns serves.
+pub const OPCODE_QUERY: u8 = 0;
 
 /// The CD (checking disabled) bit within `Header::z`, which holds the Z,
 /// AD and CD bits of byte 3 (RFC 4035 §3.2).
 pub const Z_CD: u8 = 0x01;
+
+/// The DO ("DNSSEC OK") bit in an OPT record's TTL field (RFC 3225).
+const OPT_DO: u32 = 0x8000;
 
 /// Size of the fixed DNS header in bytes.
 const HEADER_LEN: usize = 12;
@@ -518,7 +525,9 @@ impl DNSPacket {
     /// zero (RFC 1035 §4.1.1). Every TTL is reduced by `age` seconds, the
     /// time the records spent in the cache. Names are compressed, so a
     /// response rebuilt from cached records is no larger than the
-    /// upstream's compressed original.
+    /// upstream's compressed original. If the query has an EDNS OPT record,
+    /// so does the response (RFC 6891 §7): version 0, the UDP payload size
+    /// rdns accepts, and the query's DO bit.
     pub fn response_bytes(
         &self,
         rcode: u8,
@@ -536,7 +545,8 @@ impl DNSPacket {
         header.qdcount = self.questions.len() as u16;
         header.ancount = answers.len() as u16;
         header.nscount = authorities.len() as u16;
-        header.arcount = 0;
+        let opt = self.resources.iter().find(|r| r.tp == TYPE_OPT);
+        header.arcount = u16::from(opt.is_some());
 
         let mut buf = Vec::with_capacity(DEFAULT_UDP_PAYLOAD);
         let mut names = Compressor::default();
@@ -546,6 +556,14 @@ impl DNSPacket {
         }
         for a in answers.iter().chain(authorities) {
             a.write_to(&mut buf, age, &mut names);
+        }
+        if let Some(opt) = opt {
+            buf.push(0); // root owner
+            buf.extend_from_slice(&TYPE_OPT.to_be_bytes());
+            buf.extend_from_slice(&(MAX_UDP_PAYLOAD as u16).to_be_bytes());
+            // Extended RCODE 0, version 0, the DO bit, Z = 0; no options.
+            buf.extend_from_slice(&(opt.ttl & OPT_DO).to_be_bytes());
+            buf.extend_from_slice(&[0, 0]);
         }
         buf
     }

@@ -29,6 +29,8 @@ validates cached data itself. rdns is not a validating cache.)
 
 namespace Rdns
 
+def RCODE_NOTIMP : UInt8 := 4
+
 /-- The CD bit: bit 4 of byte 3, the low bit of Rust's `z`. -/
 def Header.cd (h : Header) : Bool := h.z &&& 0x01 = 0x01
 
@@ -59,6 +61,8 @@ that CD bit. Returns the RCODE and answers the client gets, and the new
 cache. -/
 def handle (cache : Option (Question × Entry)) (upstream : Bool → Packet) (q : Packet) :
     (UInt8 × Array Answer) × Option (Question × Entry) :=
+  -- Only standard queries are served; anything else gets NOTIMP (#22).
+  if q.header.opcode ≠ 0 then ((RCODE_NOTIMP, #[]), cache) else
   match cacheKey q with
   | none => ((RCODE_SERVFAIL, #[]), cache)  -- dropped; modelled as an error
   | some k =>
@@ -133,12 +137,14 @@ theorem handle_keeps_FromCd0 (upstream : Bool → Packet) (cache : Option (Quest
       · exact h k' e he
   unfold handle
   split
-  · exact h
+  · exact h  -- not a QUERY: the cache is untouched
   · split
+    · exact h
     · split
-      · exact h
+      · split
+        · exact h
+        · exact hf _
       · exact hf _
-    · exact hf _
 
 theorem foldl_FromCd0 (upstream : Bool → Packet) (l : List Packet) :
     ∀ c, FromCd0 upstream c → FromCd0 upstream (l.foldl (fun c p => (handle c upstream p).2) c) := by
@@ -148,12 +154,14 @@ theorem foldl_FromCd0 (upstream : Bool → Packet) (l : List Packet) :
 
 /-- One CD = 0 query against a cache that holds only CD = 0 answers. -/
 theorem cd0_answer (upstream : Bool → Packet) (cache : Option (Question × Entry)) (q : Packet)
-    (hinv : FromCd0 upstream cache) (hcd : q.header.cd = false) (hq : (cacheKey q).isSome) :
+    (hinv : FromCd0 upstream cache) (hop : q.header.opcode = 0) (hcd : q.header.cd = false)
+    (hq : (cacheKey q).isSome) :
     (handle cache upstream q).1 = ((upstream false).header.rcode, (upstream false).answers) := by
   have hfwd : ∀ c k, (handle.forward c upstream q k).1
       = ((upstream false).header.rcode, (upstream false).answers) := by
     intro c k; simp [handle.forward, hcd]
   unfold handle
+  simp only [hop, ne_eq, not_true_eq_false, ↓reduceIte]
   split
   · next hk => simp [hk] at hq
   · cases hc : cache with
@@ -166,20 +174,22 @@ theorem cd0_answer (upstream : Bool → Packet) (cache : Option (Question × Ent
         simp [h1, h2]
       · exact hfwd _ _
 
-/-- **F8, CD isolation.** After any sequence of earlier queries, a CD = 0
-query with a question gets exactly the upstream's CD = 0 answer. -/
+/-- **F8, CD isolation.** After any sequence of earlier queries (any
+opcode, any header bits), a CD = 0 standard query with a question gets
+exactly the upstream's CD = 0 answer. -/
 theorem cd_isolation (upstream : Bool → Packet) (earlier : List Packet) (q : Packet)
-    (hcd : q.header.cd = false) (hq : (cacheKey q).isSome) :
+    (hop : q.header.opcode = 0) (hcd : q.header.cd = false) (hq : (cacheKey q).isSome) :
     (handle (earlier.foldl (fun c p => (handle c upstream p).2) none) upstream q).1
       = ((upstream false).header.rcode, (upstream false).answers) :=
-  cd0_answer upstream _ q (foldl_FromCd0 upstream earlier none (fun _ _ h => by simp at h)) hcd hq
+  cd0_answer upstream _ q (foldl_FromCd0 upstream earlier none (fun _ _ h => by simp at h))
+    hop hcd hq
 
 /-- The former counterexample: after a CD = 1 query, a CD = 0 client still
 gets the validating upstream's SERVFAIL. -/
 theorem cd_isolation_validating : CdIsolation := by
   intro earlier
   have := cd_isolation validatingUpstream (earlier.map query) (query false) (by decide)
-    (by decide)
+    (by decide) (by decide)
   simp only [List.foldl_map] at this
   simp only [this]
   decide
@@ -190,21 +200,19 @@ example : (({ name := #[3, 87, 119, 119, 0], tp := 1, cls := 1 } : Question).sam
 
 /-! ## Opcode -/
 
-def RCODE_NOTIMP : UInt8 := 4
-
-/-- **RFC 1035 §4.1.1**: a server returns NOTIMP ("the name server does not
-support the requested kind of query") for opcodes it doesn't implement.
-rdns implements only QUERY (0). -/
+/-- **F10, RFC 1035 §4.1.1**: a server returns NOTIMP ("the name server does
+not support the requested kind of query") for opcodes it doesn't
+implement. rdns implements only QUERY (0). -/
 def OtherOpcodesNotImp : Prop :=
   ∀ (cache : Option (Question × Entry)) (upstream : Bool → Packet) (q : Packet),
-    q.header.opcode ≠ 0 → ((handle cache upstream q).1).1 = RCODE_NOTIMP
+    q.header.opcode ≠ 0 → (handle cache upstream q).1 = (RCODE_NOTIMP, #[])
+      ∧ (handle cache upstream q).2 = cache
 
-/-- **Counterexample.** An UPDATE (opcode 5) for a cached name gets the cached
-answer, NOERROR. -/
-theorem bug_opcode_ignored : ¬ OtherOpcodesNotImp := fun h => by
-  have := h (handle none (fun _ => resp RCODE_NOERROR #[aRec 3600] #[]) (query false)).2
-    validatingUpstream
-    { query false with header := { (query false).header with opcode := 5 } } (by decide)
-  revert this; decide +kernel
+/-- Every non-QUERY message gets NOTIMP with no records and leaves the cache
+alone, whatever is cached. Until #22 an UPDATE for a cached name got the
+cached answer. -/
+theorem other_opcodes_notimp : OtherOpcodesNotImp := by
+  intro cache upstream q h
+  simp [handle, h]
 
 end Rdns

@@ -3,7 +3,8 @@
 use crate::blocklist::DNSBlocklist;
 use crate::cache::DNSCache;
 use crate::packet::{
-    DNSPacket, MAX_UDP_PAYLOAD, Question, RCODE_NOERROR, RCODE_SERVFAIL, Z_CD, set_id,
+    DNSPacket, MAX_UDP_PAYLOAD, OPCODE_QUERY, Question, RCODE_NOERROR, RCODE_NOTIMP,
+    RCODE_SERVFAIL, Z_CD, set_id,
 };
 use chrono::Local;
 use clap::Parser;
@@ -175,6 +176,14 @@ async fn handle_dns_request(server: Arc<Server>, data: Vec<u8>, source: SocketAd
     };
     // Only queries are answered; stray responses are dropped.
     if packet.header.qr == 1 {
+        return;
+    }
+    // rdns implements only standard queries. IQUERY, STATUS, NOTIFY,
+    // UPDATE, ... get NOTIMP and are neither answered from the cache or
+    // blocklist nor forwarded (RFC 1035 §4.1.1).
+    if packet.header.opcode != OPCODE_QUERY {
+        let response = packet.response_bytes(RCODE_NOTIMP, &[], &[], 0);
+        let _ = server.reply(&packet, response, source).await;
         return;
     }
     let Some(question) = packet.questions.first() else {

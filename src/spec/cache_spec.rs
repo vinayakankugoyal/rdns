@@ -170,6 +170,35 @@ fn c4_cache_ttl_policy() {
             response("x.test", ok, &[], None),
             None,
         ),
+        // A negative answer behind a CNAME: the answer section holds the
+        // chain, the authority section the target zone's SOA. Both bound
+        // the lifetime (the record type in the answer section doesn't
+        // matter to the policy). Regression for #18.
+        (
+            "NXDOMAIN behind a CNAME: the CNAME's TTL bounds it",
+            response("x.test", NXDOMAIN_FLAGS, &[30], Some((3600, 3600))),
+            Some(30),
+        ),
+        (
+            "NXDOMAIN behind a CNAME: the negative TTL bounds it",
+            response("x.test", NXDOMAIN_FLAGS, &[3600], Some((3600, 60))),
+            Some(60),
+        ),
+        (
+            "NXDOMAIN with answers but no SOA",
+            response("x.test", NXDOMAIN_FLAGS, &[3600], None),
+            None,
+        ),
+        (
+            "NODATA behind a CNAME: the negative TTL bounds it",
+            response("x.test", ok, &[3600], Some((60, 60))),
+            Some(60),
+        ),
+        (
+            "NODATA behind a CNAME: the CNAME's TTL bounds it",
+            response("x.test", ok, &[30], Some((3600, 3600))),
+            Some(30),
+        ),
     ];
     for (what, packet, want) in cases {
         assert_eq!(cache_ttl(packet), *want, "{what}");
@@ -186,6 +215,55 @@ fn c5_negative_entries_keep_rcode_and_soa() {
     assert_eq!(hit.response.rcode, RCODE_NXDOMAIN);
     assert_eq!(hit.response.authorities.len(), 1);
     assert_eq!(hit.response.authorities[0].soa_minimum(), Some(900));
+}
+
+/// C5′. A negative answer behind a CNAME keeps its SOA too, and replays
+/// its CNAME. Regression for #18.
+#[test]
+fn c5_cname_negatives_keep_soa() {
+    for flags in [NXDOMAIN_FLAGS, NOERROR_FLAGS] {
+        let c = DNSCache::new(0);
+        let r = response("www.test", flags, &[30], Some((3600, 900)));
+        assert!(c.insert(question("www.test"), r));
+        let hit = c.get(&question("www.test")).unwrap();
+        assert_eq!(hit.response.rcode, flags as u8 & 0x0f);
+        assert_eq!(hit.response.answers.len(), 1);
+        assert_eq!(hit.response.authorities.len(), 1);
+        assert_eq!(hit.response.authorities[0].soa_minimum(), Some(900));
+    }
+}
+
+/// C7. Nothing stale: without `--min-cache-ttl`, an entry stops being
+/// served once any of its records, or its negative TTL, has expired.
+/// Regression for #18.
+#[test]
+fn c7_nothing_served_stale() {
+    let cases = [
+        response("a.test", NOERROR_FLAGS, &[600, 60], None),
+        response("b.test", NXDOMAIN_FLAGS, &[], Some((3600, 900))),
+        response("c.test", NXDOMAIN_FLAGS, &[30], Some((3600, 3600))),
+        response("d.test", NOERROR_FLAGS, &[3600], Some((60, 60))),
+    ];
+    for r in cases {
+        let q = r.questions[0].clone();
+        let deadline = r
+            .answers
+            .iter()
+            .map(|a| a.ttl)
+            .chain(
+                r.authorities
+                    .iter()
+                    .map(|a| a.ttl.min(a.soa_minimum().unwrap())),
+            )
+            .min()
+            .unwrap();
+        let c = DNSCache::new(0);
+        let t0 = Instant::now();
+        c.insert_at(q.clone(), r, t0);
+        let deadline = t0 + Duration::from_secs(deadline.into());
+        assert!(c.get_at(&q, deadline - Duration::from_millis(1)).is_some());
+        assert!(c.get_at(&q, deadline).is_none(), "{q} served stale");
+    }
 }
 
 /// C6. Lookups ignore the case of the name. Regression for #8.
